@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Strip Co-Authored-By trailers referencing Claude/Anthropic.
+sed -i -E '/^Co-Authored-By:.*(laude|nthropic)/Id' "$1"

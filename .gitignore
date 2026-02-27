@@ -8,3 +8,6 @@ __pycache__/
 
 # Runtime workspace (not in Dev folder)
 workspace/
+
+# Claude Code project config (local only)
+CLAUDE.md
