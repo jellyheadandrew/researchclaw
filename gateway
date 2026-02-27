@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# gateway — Start the ResearchClaw agent.
+#
+# Usage:
+#   ./gateway                       Start in foreground (Ctrl-C to stop)
+#   ./gateway --detach              Start in a tmux session
+#   ./gateway --status              Check if the agent is running
+#   ./gateway --stop                Stop the background agent
+#   ./gateway --config /path/to/config.yaml   Use a specific config
+
+set -euo pipefail
+
+# ── Resolve script directory ─────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/researchclaw/.venv"
+PYTHON="${VENV_DIR}/bin/python"
+TMUX_SESSION="researchclaw"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+
+# Ensure ~/.local/bin is on PATH (npm user-local installs, e.g. claude-code)
+[[ ":${PATH}:" != *":${HOME}/.local/bin:"* ]] && export PATH="${HOME}/.local/bin:${PATH}"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+if [ -t 1 ] && command -v tput &>/dev/null && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    BOLD="$(tput bold)"
+    GREEN="$(tput setaf 2)"
+    YELLOW="$(tput setaf 3)"
+    RED="$(tput setaf 1)"
+    CYAN="$(tput setaf 6)"
+    DIM="$(tput dim)"
+    RESET="$(tput sgr0)"
+else
+    BOLD="" GREEN="" YELLOW="" RED="" CYAN="" DIM="" RESET=""
+fi
+
+info()    { echo "${BOLD}${CYAN}==> ${RESET}${BOLD}$*${RESET}"; }
+success() { echo "${GREEN}  ✓ $*${RESET}"; }
+warn()    { echo "${YELLOW}  ! $*${RESET}"; }
+die()     { echo "${RED}  ✗ $*${RESET}" >&2; exit 1; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+ACTION="run"
+CONFIG_ARG=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config)
+            [ -z "${2:-}" ] && die "--config requires a path argument"
+            CONFIG_ARG="$2"
+            shift 2
+            ;;
+        --detach)
+            ACTION="detach"
+            shift
+            ;;
+        --status)
+            ACTION="status"
+            shift
+            ;;
+        --stop)
+            ACTION="stop"
+            shift
+            ;;
+        --help|-h)
+            cat <<USAGE
+Usage: ./gateway [OPTIONS]
+
+Start the ResearchClaw agent.
+
+Options:
+  --config PATH   Path to config.yaml (default: auto-detect)
+  --detach        Run in a tmux session (recommended for remote servers)
+  --status        Check if the agent is running (in tmux)
+  --stop          Stop the agent (if running in tmux)
+  --help          Show this message
+
+Config discovery order:
+  1. --config argument
+  2. \$RESEARCHCLAW_CONFIG environment variable
+  3. .last_config file (written by ./onboard)
+
+First-time setup:  ./onboard
+USAGE
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1 (try --help)"
+            ;;
+    esac
+done
+
+# ── Handle --status ──────────────────────────────────────────────────────────
+if [ "$ACTION" = "status" ]; then
+    if command -v tmux &>/dev/null && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        success "Agent is running in tmux session '${TMUX_SESSION}'"
+        echo "  Attach:  ${BOLD}tmux attach -t ${TMUX_SESSION}${RESET}"
+        echo "  Stop:    ${BOLD}./gateway --stop${RESET}"
+    else
+        echo "  Agent is not running in a tmux session."
+    fi
+    exit 0
+fi
+
+# ── Handle --stop ────────────────────────────────────────────────────────────
+if [ "$ACTION" = "stop" ]; then
+    if ! command -v tmux &>/dev/null; then
+        die "tmux is not installed."
+    fi
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        tmux kill-session -t "$TMUX_SESSION"
+        success "Stopped agent (killed tmux session '${TMUX_SESSION}')"
+    else
+        warn "No tmux session '${TMUX_SESSION}' found. Agent may not be running."
+    fi
+    exit 0
+fi
+
+# ── Venv check ───────────────────────────────────────────────────────────────
+if [ ! -f "$PYTHON" ]; then
+    die "Virtual environment not found at researchclaw/.venv/. Run ./onboard first."
+fi
+
+# ── Config discovery ─────────────────────────────────────────────────────────
+CONFIG_PATH=""
+
+# 1. --config argument
+if [ -n "$CONFIG_ARG" ]; then
+    CONFIG_PATH="$CONFIG_ARG"
+
+# 2. Environment variable
+elif [ -n "${RESEARCHCLAW_CONFIG:-}" ]; then
+    CONFIG_PATH="$RESEARCHCLAW_CONFIG"
+
+# 3. Breadcrumb file from ./onboard
+elif [ -f "${SCRIPT_DIR}/.last_config" ]; then
+    CONFIG_PATH="$(cat "${SCRIPT_DIR}/.last_config" | tr -d '[:space:]')"
+fi
+
+# Validate
+if [ -z "$CONFIG_PATH" ]; then
+    die "No configuration found. Run ./onboard first, or use: ./gateway --config /path/to/config.yaml"
+fi
+
+if [ ! -f "$CONFIG_PATH" ]; then
+    die "Config file not found: ${CONFIG_PATH}
+  Run ./onboard to set up, or use: ./gateway --config /path/to/config.yaml"
+fi
+
+# ── SSH warning ──────────────────────────────────────────────────────────────
+if [ "$ACTION" = "run" ] && [ -n "${SSH_CONNECTION:-}" ]; then
+    echo ""
+    warn "You are connected via SSH."
+    echo "${DIM}  If you disconnect, the agent will stop.${RESET}"
+    echo "${DIM}  Recommendation: use ${BOLD}./gateway --detach${RESET}${DIM} to run in tmux.${RESET}"
+    echo ""
+fi
+
+# ── Start agent ──────────────────────────────────────────────────────────────
+if [ "$ACTION" = "detach" ]; then
+    # ── tmux mode ────────────────────────────────────────────────────────
+    if ! command -v tmux &>/dev/null; then
+        die "tmux is not installed. Install it (sudo apt install tmux) or run without --detach."
+    fi
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        warn "tmux session '${TMUX_SESSION}' already exists."
+        echo "  Attach:  ${BOLD}tmux attach -t ${TMUX_SESSION}${RESET}"
+        echo "  Stop:    ${BOLD}./gateway --stop${RESET}"
+        exit 1
+    fi
+
+    tmux new-session -d -s "$TMUX_SESSION" \
+        "'${PYTHON}' -m researchclaw.agent '${CONFIG_PATH}'"
+
+    success "Agent started in tmux session '${TMUX_SESSION}'"
+    echo ""
+    echo "  Attach:   ${BOLD}tmux attach -t ${TMUX_SESSION}${RESET}"
+    echo "  Detach:   ${DIM}Ctrl-B, then D${RESET}"
+    echo "  Status:   ${BOLD}./gateway --status${RESET}"
+    echo "  Stop:     ${BOLD}./gateway --stop${RESET}"
+    echo ""
+
+else
+    # ── foreground mode ──────────────────────────────────────────────────
+    info "Starting ResearchClaw agent..."
+    echo "${DIM}  Config: ${CONFIG_PATH}${RESET}"
+    echo "${DIM}  Stop:   Ctrl-C${RESET}"
+    echo ""
+    exec "$PYTHON" -m researchclaw.agent "$CONFIG_PATH"
+fi

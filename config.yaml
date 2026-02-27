@@ -1,0 +1,100 @@
+# ResearchClaw Configuration
+# Edit this file before starting the agent.
+#
+# SECRETS (API keys, bot tokens) do NOT go here.
+# Put them in a .env file next to this file (see .env.example).
+# The agent loads .env automatically on startup.
+
+# ── Project ───────────────────────────────────────────────────────────────────
+project_name: "my-research-project"
+base_dir: "./workspace"
+github_remote: "origin"
+github_branch: "main"
+
+# ── Messenger ─────────────────────────────────────────────────────────────────
+# How ResearchClaw communicates with you.  Choose one type:
+#
+#   telegram — Telegram bot (recommended for VM deployments; no public IP needed)
+#   slack    — Slack via OpenClaw (requires OpenClaw to be set up separately)
+#   stdio    — stdin/stdout (local development only)
+#
+# Web UI / backend note:
+#   Write this section based on what the user selected in the setup form.
+#   Put the bot token in .env (see .env.example), not here.
+messenger:
+  type: stdio                            # telegram | slack | stdio
+
+  # ── Telegram (used when type: telegram) ──────────────────────────────────
+  telegram_chat_id: ""                   # your chat or group ID (not a secret)
+                                         # find it: python -m researchclaw.get_chat_id
+  telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"  # env var name for the token (in .env)
+  telegram_poll_timeout: 30             # long-polling server timeout (seconds)
+  telegram_poll_interval: 1.0           # retry delay after an empty poll (seconds)
+
+  # ── Slack (used when type: slack) ─────────────────────────────────────────
+  slack_channel: "#research-agent"       # dedicated Slack channel for agent messages
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+llm:
+  # Option A (recommended): Claude Code CLI — uses your existing Claude login.
+  # No separate API key needed.  Requires `claude` to be installed and logged in.
+  provider: claude_cli
+  model: claude-sonnet-4-6
+  cli_path: claude                       # path to claude binary (default: from PATH)
+
+  # Option B: Anthropic API key.
+  # Uncomment and comment out Option A.  Add ANTHROPIC_API_KEY to .env.
+  # provider: anthropic
+  # model: claude-sonnet-4-6
+  # api_key_env: ANTHROPIC_API_KEY
+
+  # Option C: OpenAI (not yet implemented — stub only).
+  # provider: openai
+  # model: gpt-4o
+  # api_key_env: OPENAI_API_KEY
+
+  # Option D: Ollama (not yet implemented — stub only).
+  # provider: ollama
+  # model: llama3
+
+# ── Watcher ───────────────────────────────────────────────────────────────────
+watcher:
+  poll_interval: 10                      # seconds between process checks
+  status_update_interval: 7200          # periodic update every 2 hours (0 = disable)
+  heartbeat_timeout: 300                 # warn if no log output for 5 minutes
+  gpu_idle_threshold: 60                 # seconds of 0% GPU before considering idle
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+sandbox:
+  copy_ignore_patterns:                  # don't copy these from github_codes to sandbox
+    - ".git"
+    - "__pycache__"
+    - "*.pyc"
+    - "wandb"
+    - "outputs"
+    - "checkpoints"
+    - "*.pt"
+    - "*.ckpt"
+    - "*.safetensors"
+    - "*.bin"
+    - "node_modules"
+  auto_continue_sequential: true         # auto-start next queued trial if previous succeeded
+
+# ── Environment management ────────────────────────────────────────────────────
+# The agent automatically creates and manages Python environments for experiments.
+# Environments are shared across trials until a pip/conda install is needed,
+# then a new environment is forked (copy-on-write).
+env:
+  backend: venv                          # venv | conda
+
+# ── Experiment runner ─────────────────────────────────────────────────────────
+runner:
+  default_env: ""                        # conda env to activate (empty = system python)
+  venv_path: ""                          # venv to activate (empty = none)
+  always_confirm: true                   # always ask Y/N before running (recommended)
+
+# ── Report generation ─────────────────────────────────────────────────────────
+report:
+  include_diff: true                     # include code diff in REPORT.md
+  include_log_tail: 50                   # last N lines of log to include
+  include_gpu_info: true                 # include GPU utilization summary

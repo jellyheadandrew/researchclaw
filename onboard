@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# onboard — ResearchClaw first-time setup.
+#
+# Usage:  ./onboard [--skip-deps] [--help]
+#
+# Handles everything from a fresh clone to a working configuration:
+#   1. Creates Python virtual environment
+#   2. Installs dependencies
+#   3. (Optional) Discovers your Telegram chat ID
+#   4. Runs the interactive setup wizard
+#   5. Validates the configuration
+#
+# After setup, start the agent with:  ./gateway
+
+set -euo pipefail
+
+# ── Resolve script directory (follows symlinks) ─────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/researchclaw/.venv"
+PYTHON="${VENV_DIR}/bin/python"
+PIP="${VENV_DIR}/bin/pip"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+
+# Ensure ~/.local/bin is on PATH (npm user-local installs, e.g. claude-code)
+[[ ":${PATH}:" != *":${HOME}/.local/bin:"* ]] && export PATH="${HOME}/.local/bin:${PATH}"
+
+# ── Colors (if terminal supports it) ────────────────────────────────────────
+if [ -t 1 ] && command -v tput &>/dev/null && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    BOLD="$(tput bold)"
+    GREEN="$(tput setaf 2)"
+    YELLOW="$(tput setaf 3)"
+    RED="$(tput setaf 1)"
+    CYAN="$(tput setaf 6)"
+    DIM="$(tput dim)"
+    RESET="$(tput sgr0)"
+else
+    BOLD="" GREEN="" YELLOW="" RED="" CYAN="" DIM="" RESET=""
+fi
+
+info()    { echo "${BOLD}${CYAN}==> ${RESET}${BOLD}$*${RESET}"; }
+success() { echo "${GREEN}  ✓ $*${RESET}"; }
+warn()    { echo "${YELLOW}  ! $*${RESET}"; }
+die()     { echo "${RED}  ✗ $*${RESET}" >&2; exit 1; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+SKIP_DEPS=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --skip-deps) SKIP_DEPS=true ;;
+        --help|-h)
+            cat <<USAGE
+Usage: ./onboard [OPTIONS]
+
+Interactive setup for ResearchClaw. Handles virtual environment,
+dependencies, Telegram chat ID discovery, configuration, and validation.
+
+Options:
+  --skip-deps   Skip dependency installation
+  --help        Show this message
+
+After setup, start the agent with:  ./gateway
+USAGE
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $arg (try --help)"
+            ;;
+    esac
+done
+
+# ── Banner ───────────────────────────────────────────────────────────────────
+echo ""
+echo "${BOLD}${CYAN}╭──────────────────────────────────╮${RESET}"
+echo "${BOLD}${CYAN}│   ResearchClaw — Setup Wizard    │${RESET}"
+echo "${BOLD}${CYAN}╰──────────────────────────────────╯${RESET}"
+echo ""
+
+# ── Step 1: Prerequisites ───────────────────────────────────────────────────
+info "Checking prerequisites..."
+
+if ! command -v python3 &>/dev/null; then
+    die "python3 not found. Install Python 3.10+ and re-run."
+fi
+
+PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYVER_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 10) else 0)')
+if [ "$PYVER_OK" != "1" ]; then
+    die "Python 3.10+ required (found $PYVER)."
+fi
+success "Python $PYVER"
+
+if ! python3 -m pip --version &>/dev/null 2>&1; then
+    die "pip not available. Try: sudo apt install python3-pip"
+fi
+success "pip available"
+
+# ── Step 2: Virtual environment ──────────────────────────────────────────────
+info "Setting up virtual environment..."
+
+if [ -f "${PYTHON}" ]; then
+    success "Virtual environment already exists at researchclaw/.venv/"
+else
+    python3 -m venv "$VENV_DIR" || die "Failed to create venv. Try: sudo apt install python3-venv"
+    success "Created virtual environment at researchclaw/.venv/"
+fi
+
+# Ensure envs/ directory exists (experiment environments are managed here)
+mkdir -p "${SCRIPT_DIR}/envs"
+
+# ── Step 3: Dependencies ────────────────────────────────────────────────────
+if [ "$SKIP_DEPS" = false ]; then
+    info "Checking dependencies..."
+
+    if "$PYTHON" -c "import questionary, rich, yaml, dotenv, telebot, slack_sdk" 2>/dev/null; then
+        success "All dependencies already installed"
+    else
+        info "Installing dependencies (this may take a moment)..."
+        "$PIP" install --quiet --upgrade pip 2>/dev/null
+        "$PIP" install --quiet -r "${SCRIPT_DIR}/requirements.txt" \
+            || die "Dependency install failed. Check your internet connection."
+        success "Dependencies installed"
+    fi
+else
+    warn "Skipping dependency install (--skip-deps)"
+fi
+
+# ── Step 4: Telegram token (optional — pre-fills the setup wizard) ───────────
+echo ""
+info "Telegram bot token (optional)"
+echo "${DIM}  If you plan to use Telegram, paste your bot token now to pre-fill${RESET}"
+echo "${DIM}  the setup wizard.  Chat ID will be auto-detected.${RESET}"
+echo "${DIM}  Press Enter to skip if you don't use Telegram.${RESET}"
+echo ""
+
+_ONBOARD_TG_TOKEN=""
+read -r -s -p "  Telegram bot token (hidden, Enter to skip): " tg_token
+echo ""
+if [ -n "$tg_token" ]; then
+    _ONBOARD_TG_TOKEN="$tg_token"
+    success "Bot token will be pre-filled in the setup wizard."
+fi
+
+# ── Step 5: Interactive setup wizard ─────────────────────────────────────────
+echo ""
+info "Starting interactive setup wizard..."
+echo ""
+
+# Record breadcrumb state before setup so we can detect cancellation.
+# setup_tui.py exits 0 on both success AND user-cancel, so we check
+# whether .last_config was actually written/updated instead.
+BREADCRUMB="${SCRIPT_DIR}/.last_config"
+BREADCRUMB_BEFORE=""
+if [ -f "$BREADCRUMB" ]; then
+    BREADCRUMB_BEFORE="$(cat "$BREADCRUMB")"
+fi
+
+# Pass discovered Telegram token so setup_tui can pre-fill it
+export _ONBOARD_TG_TOKEN
+"$PYTHON" "${SCRIPT_DIR}/setup_tui.py"
+SETUP_EXIT=$?
+
+if [ "$SETUP_EXIT" -ne 0 ]; then
+    die "Setup wizard did not complete successfully."
+fi
+
+# Check if setup_tui actually completed (wrote a new breadcrumb)
+BREADCRUMB_AFTER=""
+if [ -f "$BREADCRUMB" ]; then
+    BREADCRUMB_AFTER="$(cat "$BREADCRUMB")"
+fi
+
+if [ -z "$BREADCRUMB_AFTER" ] || [ "$BREADCRUMB_AFTER" = "$BREADCRUMB_BEFORE" -a -z "$BREADCRUMB_AFTER" ]; then
+    echo ""
+    warn "Setup was cancelled. Run ./onboard again when ready."
+    exit 0
+fi
+
+CONFIG_PATH="$(echo "$BREADCRUMB_AFTER" | tr -d '[:space:]')"
+
+# ── Step 6: Validation ──────────────────────────────────────────────────────
+echo ""
+info "Validating configuration..."
+"$PYTHON" -m researchclaw.init "$CONFIG_PATH" || true
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "${BOLD}${GREEN}╭──────────────────────────────────╮${RESET}"
+echo "${BOLD}${GREEN}│       Setup complete!            │${RESET}"
+echo "${BOLD}${GREEN}╰──────────────────────────────────╯${RESET}"
+echo ""
+echo "  Start the agent:       ${BOLD}./gateway${RESET}"
+echo "  Start in background:   ${BOLD}./gateway --detach${RESET}"
+echo "  Re-run setup anytime:  ${BOLD}./onboard${RESET}"
+echo ""
