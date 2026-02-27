@@ -1,27 +1,22 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "researchclaw"
-version = "0.1.0"
-description = "AI-powered research collaborator for ML experiment workflows"
+version = "2.0.0"
+description = "ResearchClaw V2 - chat-first research orchestrator with strict FSM and access policy"
 readme = "README.md"
-license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
-    "PyYAML>=6.0",
-    "anthropic>=0.80.0",
-    "openai>=1.0.0",
-    "python-dotenv>=1.0.0",
-    "pyTelegramBotAPI>=4.17.0",
-    "slack_sdk>=3.27.0",
-    "questionary>=2.0.0",
-    "rich>=13.0.0",
+  "PyYAML>=6.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["researchclaw*"]
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["researchclaw/tests"]
+addopts = "-q"

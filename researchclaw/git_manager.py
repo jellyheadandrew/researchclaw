@@ -1,250 +1,184 @@
-"""
-git_manager.py — GitHub operations: pull, diff, merge approved trials, push.
-
-The researcher's canonical codebase lives in github_codes/.
-When a trial is approved, changes from sandbox/trial_N/ are merged back
-into github_codes/ and committed. The researcher is then prompted to push.
-push() is only called after explicit researcher confirmation — never silently.
-"""
-
 from __future__ import annotations
 
 import filecmp
-import logging
 import shutil
 import subprocess
 from pathlib import Path
 
-from .models import TrialInfo
-
-logger = logging.getLogger("researchclaw.git_manager")
+from .models import ProjectGitConfig, Settings, TrialRecord
+from .policy import AuthorityManager, Operation
+from .states import State
 
 
 class GitManager:
-    """Manage the github_codes/ repository and trial merge workflow."""
-
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, authority: AuthorityManager):
         self.base_dir = Path(base_dir).resolve()
-        self.repo_path = self.base_dir / "github_codes"
-        # Must call authorize_merge() before merge_trial() to prevent accidental merges.
-        self._merge_authorized: bool = False
+        self.authority = authority
 
-    def authorize_merge(self) -> None:
-        """
-        Grant one-time authorization to call merge_trial().
-        Must be set explicitly by the approval handler after researcher confirms.
-        Authorization is consumed (reset to False) after each merge_trial() call.
-        """
-        self._merge_authorized = True
-        logger.info("Merge into github_codes/ authorized for next merge_trial() call.")
-
-    # ------------------------------------------------------------------
-    # Repository operations
-    # ------------------------------------------------------------------
-
-    def pull(self) -> str:
-        """
-        Pull latest changes from remote.
-        Uses --rebase to keep a clean history.
-        Returns git output.
-        """
-        rc, stdout, stderr = self._git("pull", "--rebase")
-        if rc != 0:
-            raise RuntimeError(f"git pull failed:\n{stderr}")
-        logger.info("git pull: %s", stdout.strip())
-        return stdout
-
-    def status(self) -> str:
-        """Return current branch, last commit, and working tree status."""
-        _, branch, _ = self._git("branch", "--show-current")
-        _, log, _ = self._git("log", "--oneline", "-1")
-        _, status, _ = self._git("status", "--short")
-        return (
-            f"Branch: {branch.strip()}\n"
-            f"Last commit: {log.strip()}\n"
-            f"Status: {status.strip() or 'clean'}"
-        )
-
-    def push(self) -> str:
-        """
-        Push to remote.
-        Only called when researcher explicitly requests it.
-        Returns git output.
-        """
-        rc, stdout, stderr = self._git("push")
-        if rc != 0:
-            raise RuntimeError(f"git push failed:\n{stderr}")
-        logger.info("git push: %s", stdout.strip())
-        return stdout
-
-    # ------------------------------------------------------------------
-    # Trial diff and merge
-    # ------------------------------------------------------------------
-
-    def get_diff(self, trial: TrialInfo) -> str:
-        """
-        Generate a human-readable diff between github_codes/ and sandbox/trial_N/.
-        Returns a summary of what the agent changed during the trial.
-        """
-        sandbox = self.base_dir / trial.sandbox_path
-        if not sandbox.exists():
-            return f"(sandbox directory not found: {sandbox})"
-
-        # Find files that differ
-        changed, added, removed = self._compare_trees(self.repo_path, sandbox)
-
-        lines = []
-        if changed:
-            lines.append(f"**Modified files ({len(changed)}):**")
-            for f in sorted(changed):
-                lines.append(f"  ~ {f}")
-        if added:
-            lines.append(f"\n**New files ({len(added)}):**")
-            for f in sorted(added):
-                lines.append(f"  + {f}")
-        if removed:
-            lines.append(f"\n**Removed files ({len(removed)}):**")
-            for f in sorted(removed):
-                lines.append(f"  - {f}")
-
-        if not lines:
-            return "(no differences found)"
-
-        return "\n".join(lines)
-
-    def get_full_diff(self, trial: TrialInfo) -> str:
-        """
-        Generate a unified diff (git-style) between github_codes/ and sandbox/trial_N/.
-        Returns the raw diff text for inclusion in REPORT.md.
-        """
-        sandbox = self.base_dir / trial.sandbox_path
-        changed, _, _ = self._compare_trees(self.repo_path, sandbox)
-
-        diff_parts = []
-        for rel_path in sorted(changed):
-            src = self.repo_path / rel_path
-            dst = sandbox / rel_path
-            if src.exists() and dst.exists():
-                result = subprocess.run(
-                    ["diff", "-u", str(src), str(dst)],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.stdout:
-                    diff_parts.append(result.stdout)
-
-        return "\n".join(diff_parts) if diff_parts else "(no changes)"
-
-    def merge_trial(self, trial: TrialInfo, commit_message: str) -> str:
-        """
-        Merge approved trial code back into github_codes/.
-
-        REQUIRES: authorize_merge() must be called first. Authorization is consumed
-        after this call to prevent accidental re-merges.
-
-        Steps:
-        1. Copy only changed/new files from sandbox/trial_N/ → github_codes/
-           (unchanged files are NOT overwritten)
-        2. git add -A
-        3. git commit -m "{commit_message}"
-        4. Does NOT push. Researcher must explicitly say "push".
-
-        Returns the commit hash.
-        """
-        if not self._merge_authorized:
-            raise PermissionError(
-                "merge_trial() called without authorization. "
-                "Call authorize_merge() after explicit researcher approval first."
-            )
-        self._merge_authorized = False  # consume authorization — one-time use
-
-        sandbox = self.base_dir / trial.sandbox_path
-        if not sandbox.exists():
-            raise FileNotFoundError(f"Sandbox not found: {sandbox}")
-
-        changed, added, _ = self._compare_trees(self.repo_path, sandbox)
-
-        # Copy changed and new files
-        files_copied = 0
-        for rel_path in changed | added:
-            src = sandbox / rel_path
-            dst = self.repo_path / rel_path
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            logger.debug("Copied: %s", rel_path)
-            files_copied += 1
-
-        if files_copied == 0:
-            logger.info("No files to merge — sandbox is identical to github_codes/")
-            return "(no changes to commit)"
-
-        # Stage and commit
-        rc, _, stderr = self._git("add", "-A")
-        if rc != 0:
-            raise RuntimeError(f"git add failed:\n{stderr}")
-
-        rc, stdout, stderr = self._git("commit", "-m", commit_message)
-        if rc != 0:
-            raise RuntimeError(f"git commit failed:\n{stderr}")
-
-        # Extract commit hash
-        _, hash_out, _ = self._git("rev-parse", "--short", "HEAD")
-        commit_hash = hash_out.strip()
-
-        logger.info("Merged trial %s → commit %s (%d files)", trial.trial_name, commit_hash, files_copied)
-        return commit_hash
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    def _compare_trees(
+    def add_project_clone(
         self,
-        src: Path,
-        dst: Path,
-    ) -> tuple[set[str], set[str], set[str]]:
-        """
-        Compare two directory trees.
-        Returns (changed_files, added_files, removed_files) as sets of relative paths.
+        state: State,
+        project_name: str,
+        remote_url: str,
+        branch: str,
+    ) -> str:
+        self.authority.assert_operation(state, Operation.GIT_MUTATE)
+        projects_root = self.base_dir / "projects"
+        projects_root.mkdir(parents=True, exist_ok=True)
+        target = projects_root / project_name
+        if target.exists():
+            raise FileExistsError(f"project already exists: {project_name}")
 
-        Excludes: .git/, __pycache__/, *.pyc, *.pt, *.ckpt (large binary files)
-        """
-        ignore_patterns = {".git", "__pycache__", "wandb", "checkpoints"}
-        ignore_extensions = {".pyc", ".pt", ".ckpt", ".safetensors", ".bin"}
-
-        def collect_files(root: Path) -> set[str]:
-            result = set()
-            for p in root.rglob("*"):
-                if p.is_file():
-                    rel = str(p.relative_to(root))
-                    # Skip ignored directories
-                    parts = Path(rel).parts
-                    if any(part in ignore_patterns for part in parts):
-                        continue
-                    if p.suffix in ignore_extensions:
-                        continue
-                    result.add(rel)
-            return result
-
-        src_files = collect_files(src)
-        dst_files = collect_files(dst)
-
-        added = dst_files - src_files
-        removed = src_files - dst_files
-        common = src_files & dst_files
-
-        changed = set()
-        for rel in common:
-            if not filecmp.cmp(src / rel, dst / rel, shallow=False):
-                changed.add(rel)
-
-        return changed, added, removed
-
-    def _git(self, *args: str) -> tuple[int, str, str]:
-        """Run a git command in the repo directory."""
         result = subprocess.run(
-            ["git", "-C", str(self.repo_path)] + list(args),
+            ["git", "clone", remote_url, str(target)],
             capture_output=True,
             text=True,
         )
-        return result.returncode, result.stdout, result.stderr
+        if result.returncode != 0:
+            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+
+        if branch:
+            self._run_git(target, "checkout", branch)
+        return f"cloned {project_name}"
+
+    def add_project_init(
+        self,
+        state: State,
+        project_name: str,
+        remote_url: str,
+        branch: str,
+    ) -> str:
+        self.authority.assert_operation(state, Operation.GIT_MUTATE)
+        target = self.base_dir / "projects" / project_name
+        if target.exists():
+            raise FileExistsError(f"project already exists: {project_name}")
+        target.mkdir(parents=True, exist_ok=True)
+
+        self._run_git(target, "init")
+        self._ensure_identity(target)
+        if branch:
+            self._run_git(target, "checkout", "-b", branch)
+        if remote_url:
+            self._run_git(target, "remote", "add", "origin", remote_url)
+
+        readme = target / "README.md"
+        if not readme.exists():
+            readme.write_text(f"# {project_name}\n", encoding="utf-8")
+        self._run_git(target, "add", "-A")
+        self._run_git(target, "commit", "-m", "Initialize project scaffold")
+        return f"initialized {project_name}"
+
+    def assimilate_trial_codes(
+        self,
+        state: State,
+        trial: TrialRecord,
+        project_name: str,
+    ) -> list[str]:
+        self.authority.assert_operation(state, Operation.GIT_MUTATE)
+
+        project_root = self.base_dir / "projects" / project_name
+        trial_codes = self.base_dir / trial.sandbox_path / "codes"
+        if not project_root.exists():
+            raise FileNotFoundError(f"project not found: {project_name}")
+        if not trial_codes.exists():
+            raise FileNotFoundError(f"trial codes missing: {trial_codes}")
+
+        copied: list[str] = []
+        for src in trial_codes.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(trial_codes)
+            dst = project_root / rel
+            self.authority.validate_write_path(
+                state,
+                dst,
+                trial=None,
+                selected_project=project_name,
+            )
+            if dst.exists() and filecmp.cmp(src, dst, shallow=False):
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append(str(rel))
+
+        return copied
+
+    def commit_and_push(
+        self,
+        state: State,
+        project_name: str,
+        cfg: ProjectGitConfig,
+        message: str,
+    ) -> str:
+        self.authority.assert_operation(state, Operation.GIT_MUTATE)
+        project_root = self.base_dir / "projects" / project_name
+        if not project_root.exists():
+            raise FileNotFoundError(f"project not found: {project_name}")
+
+        # Keep remote URL aligned with settings when provided.
+        if cfg.remote_url:
+            remotes = self._run_git(project_root, "remote").stdout.strip().splitlines()
+            if "origin" not in remotes:
+                self._run_git(project_root, "remote", "add", "origin", cfg.remote_url)
+            else:
+                self._run_git(project_root, "remote", "set-url", "origin", cfg.remote_url)
+
+        if cfg.default_branch:
+            self._run_git(project_root, "checkout", "-B", cfg.default_branch)
+
+        self._ensure_identity(project_root)
+        self._run_git(project_root, "add", "-A")
+        commit = subprocess.run(
+            ["git", "-C", str(project_root), "commit", "-m", message],
+            capture_output=True,
+            text=True,
+        )
+        if commit.returncode != 0:
+            combined = (commit.stderr or commit.stdout).strip().lower()
+            if "nothing to commit" in combined:
+                # no-op commit is acceptable in assimilation flow
+                return "no changes to commit"
+            raise RuntimeError(f"git commit failed: {commit.stderr.strip() or commit.stdout.strip()}")
+
+        push = subprocess.run(
+            ["git", "-C", str(project_root), "push", "-u", "origin", cfg.default_branch or "main"],
+            capture_output=True,
+            text=True,
+        )
+        if push.returncode != 0:
+            raise RuntimeError(f"git push failed: {push.stderr.strip() or push.stdout.strip()}")
+        return push.stdout.strip() or "pushed"
+
+    @staticmethod
+    def _run_git(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
+        return result
+
+    def _ensure_identity(self, project_root: Path) -> None:
+        email = subprocess.run(
+            ["git", "-C", str(project_root), "config", "--get", "user.email"],
+            capture_output=True,
+            text=True,
+        )
+        name = subprocess.run(
+            ["git", "-C", str(project_root), "config", "--get", "user.name"],
+            capture_output=True,
+            text=True,
+        )
+
+        if email.returncode != 0 or not email.stdout.strip():
+            self._run_git(project_root, "config", "user.email", "researchclaw@local")
+        if name.returncode != 0 or not name.stdout.strip():
+            self._run_git(project_root, "config", "user.name", "ResearchClaw")
+
+
+def ensure_project_config(settings: Settings, project_name: str) -> ProjectGitConfig:
+    if project_name not in settings.projects:
+        settings.projects[project_name] = ProjectGitConfig()
+    return settings.projects[project_name]

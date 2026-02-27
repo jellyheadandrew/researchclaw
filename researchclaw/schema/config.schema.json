@@ -1,279 +1,38 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "researchclaw/config.schema.json",
-  "title": "ResearchClaw Configuration",
-  "description": "Schema for config.yaml (non-secret fields only). Secrets go in .env — see the top-level `secrets` key below for what env vars are expected and when.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResearchClaw V2 Config",
   "type": "object",
-  "required": ["base_dir"],
-
   "properties": {
-    "project_name": {
-      "type": "string",
-      "title": "Project Name",
-      "description": "Human-readable name for this research project.",
-      "default": "my-research-project",
-      "examples": ["gpt-finetuning-jan", "vision-transformer-exp"]
-    },
     "base_dir": {
-      "type": "string",
-      "title": "Base Directory",
-      "description": "Absolute path to the ResearchClaw working directory on the VM. All subdirectories (github_codes/, sandbox/, experiment_reports/, reference/) are created here. reference/ is user-managed and read-only to the agent.",
-      "examples": ["./workspace", "/home/user/research"]
+      "type": "string"
     },
-    "github_remote": {
-      "type": "string",
-      "title": "GitHub Remote",
-      "description": "Name of the git remote to push to.",
-      "default": "origin"
-    },
-    "github_branch": {
-      "type": "string",
-      "title": "GitHub Branch",
-      "description": "Branch to merge approved trials into and push.",
-      "default": "main"
-    },
-
     "messenger": {
       "type": "object",
-      "title": "Messenger",
-      "description": "How ResearchClaw communicates with you.",
-      "required": ["type"],
       "properties": {
         "type": {
           "type": "string",
-          "title": "Messenger Type",
-          "description": "Transport to use for researcher communication.",
-          "enum": ["telegram", "slack", "stdio"],
-          "enumDescriptions": {
-            "telegram": "Telegram Bot API via long-polling. No public IP needed. Recommended for VM deployments.",
-            "slack": "Slack via OpenClaw. Requires OpenClaw to be set up separately.",
-            "stdio": "stdin/stdout. For local development and testing only."
-          },
-          "default": "stdio"
-        },
-        "telegram_chat_id": {
-          "type": "string",
-          "title": "Telegram Chat ID",
-          "description": "Your personal chat ID or group ID. Not a secret. Run `python -m researchclaw.get_chat_id` to find it.",
-          "examples": ["123456789", "-100987654321"],
-          "ui:condition": {"messenger.type": "telegram"}
-        },
-        "telegram_bot_token_env": {
-          "type": "string",
-          "title": "Telegram Token Env Var",
-          "description": "Name of the environment variable (in .env) that holds the bot token.",
-          "default": "TELEGRAM_BOT_TOKEN",
-          "ui:condition": {"messenger.type": "telegram"}
-        },
-        "telegram_poll_timeout": {
-          "type": "integer",
-          "title": "Telegram Poll Timeout (s)",
-          "description": "Long-polling server timeout in seconds.",
-          "default": 30,
-          "minimum": 1,
-          "maximum": 60,
-          "ui:condition": {"messenger.type": "telegram"},
-          "ui:advanced": true
-        },
-        "telegram_poll_interval": {
-          "type": "number",
-          "title": "Telegram Poll Interval (s)",
-          "description": "Retry delay after an empty poll.",
-          "default": 1.0,
-          "minimum": 0.1,
-          "ui:condition": {"messenger.type": "telegram"},
-          "ui:advanced": true
-        },
-        "slack_channel": {
-          "type": "string",
-          "title": "Slack Channel",
-          "description": "Dedicated Slack channel for agent messages.",
-          "default": "#research-agent",
-          "examples": ["#research-agent", "#gpu-experiments"],
-          "ui:condition": {"messenger.type": "slack"}
+          "enum": ["stdio"]
         }
-      }
+      },
+      "required": ["type"],
+      "additionalProperties": false
     },
-
-    "llm": {
+    "planner": {
       "type": "object",
-      "title": "LLM Provider",
-      "description": "Which language model to use for research reasoning.",
       "properties": {
-        "provider": {
-          "type": "string",
-          "title": "Provider",
-          "enum": ["claude_cli", "anthropic"],
-          "enumDescriptions": {
-            "claude_cli": "Uses the `claude` CLI binary (recommended). No separate API key needed — shares your existing Claude Code login.",
-            "anthropic": "Direct Anthropic SDK. Requires ANTHROPIC_API_KEY in .env."
-          },
-          "default": "claude_cli"
+        "use_claude": {
+          "type": "boolean"
+        },
+        "claude_cli_path": {
+          "type": "string"
         },
         "model": {
-          "type": "string",
-          "title": "Model",
-          "description": "Model identifier.",
-          "default": "claude-sonnet-4-6",
-          "examples": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
-        },
-        "cli_path": {
-          "type": "string",
-          "title": "Claude CLI Path",
-          "description": "Path to the `claude` binary. Leave as 'claude' if it's on PATH.",
-          "default": "claude",
-          "ui:condition": {"llm.provider": "claude_cli"}
-        },
-        "api_key_env": {
-          "type": "string",
-          "title": "API Key Env Var",
-          "description": "Name of the environment variable (in .env) that holds the Anthropic API key.",
-          "default": "ANTHROPIC_API_KEY",
-          "ui:condition": {"llm.provider": "anthropic"}
+          "type": "string"
         }
-      }
-    },
-
-    "watcher": {
-      "type": "object",
-      "title": "Watcher",
-      "description": "Process monitoring settings.",
-      "ui:advanced": true,
-      "properties": {
-        "poll_interval": {
-          "type": "integer", "title": "Poll Interval (s)",
-          "description": "How often (in seconds) to check experiment status.",
-          "default": 10, "minimum": 1
-        },
-        "status_update_interval": {
-          "type": "integer", "title": "Status Update Interval (s)",
-          "description": "How often to send periodic status updates. 0 = disable.",
-          "default": 7200, "minimum": 0
-        },
-        "heartbeat_timeout": {
-          "type": "integer", "title": "Heartbeat Timeout (s)",
-          "description": "Warn if no log output is seen for this many seconds.",
-          "default": 300, "minimum": 30
-        },
-        "gpu_idle_threshold": {
-          "type": "integer", "title": "GPU Idle Threshold (s)",
-          "description": "Seconds of 0% GPU utilization before flagging the process as idle.",
-          "default": 60, "minimum": 10
-        }
-      }
-    },
-
-    "env": {
-      "type": "object",
-      "title": "Environment Management",
-      "description": "The agent automatically creates and manages Python environments for experiments. Environments are shared across trials until a pip/conda install is needed, then a new environment is forked (copy-on-write).",
-      "properties": {
-        "backend": {
-          "type": "string",
-          "title": "Backend",
-          "description": "Which tool to use for creating experiment environments.",
-          "enum": ["venv", "conda"],
-          "enumDescriptions": {
-            "venv": "Python venv (recommended). Lightweight, no extra tools needed.",
-            "conda": "Conda environments. Use if your experiments need conda-specific packages."
-          },
-          "default": "venv"
-        }
-      }
-    },
-
-    "sandbox": {
-      "type": "object",
-      "title": "Sandbox",
-      "description": "Trial sandbox settings.",
-      "ui:advanced": true,
-      "properties": {
-        "copy_ignore_patterns": {
-          "type": "array",
-          "title": "Copy Ignore Patterns",
-          "description": "Files/directories to exclude when copying github_codes/ to a trial sandbox. Supports glob patterns.",
-          "items": {"type": "string"},
-          "default": [".git", "__pycache__", "*.pyc", "wandb", "outputs", "checkpoints", "*.pt", "*.ckpt", "*.safetensors", "*.bin", "node_modules"]
-        },
-        "auto_continue_sequential": {
-          "type": "boolean",
-          "title": "Auto-continue Sequential Trials",
-          "description": "Automatically start the next queued trial after a successful one.",
-          "default": true
-        }
-      }
-    },
-
-    "runner": {
-      "type": "object",
-      "title": "Runner",
-      "description": "Experiment execution settings.",
-      "ui:advanced": true,
-      "properties": {
-        "default_env": {
-          "type": "string", "title": "Conda Environment",
-          "description": "Conda environment to activate before running. Empty = system Python.",
-          "default": ""
-        },
-        "venv_path": {
-          "type": "string", "title": "Virtualenv Path",
-          "description": "Path to a virtualenv to activate. Empty = none.",
-          "default": ""
-        },
-        "always_confirm": {
-          "type": "boolean", "title": "Always Confirm Before Running",
-          "description": "Ask Y/N before executing any command. Strongly recommended.",
-          "default": true
-        }
-      }
-    },
-
-    "report": {
-      "type": "object",
-      "title": "Report",
-      "description": "Report generation settings.",
-      "ui:advanced": true,
-      "properties": {
-        "include_diff": {
-          "type": "boolean", "title": "Include Code Diff",
-          "description": "Include the code diff in REPORT.md.",
-          "default": true
-        },
-        "include_log_tail": {
-          "type": "integer", "title": "Log Tail Lines",
-          "description": "Number of log lines to include in the report.",
-          "default": 50, "minimum": 0
-        },
-        "include_gpu_info": {
-          "type": "boolean", "title": "Include GPU Info",
-          "description": "Include GPU utilization summary in the report.",
-          "default": true
-        }
-      }
+      },
+      "additionalProperties": false
     }
   },
-
-  "secrets": {
-    "description": "These values go in .env (not config.yaml). The agent loads .env automatically. Each entry lists the env-var name, what it's for, and when it's required.",
-    "TELEGRAM_BOT_TOKEN": {
-      "title": "Telegram Bot Token",
-      "description": "Bot token from @BotFather. Looks like '123456:ABCdef...'",
-      "required_when": {"messenger.type": "telegram"},
-      "ui:type": "password"
-    },
-    "ANTHROPIC_API_KEY": {
-      "title": "Anthropic API Key",
-      "description": "API key from console.anthropic.com. Starts with 'sk-ant-'.",
-      "required_when": {"llm.provider": "anthropic"},
-      "ui:type": "password"
-    }
-  },
-
-  "ui:groups": [
-    {"title": "Project", "fields": ["project_name", "base_dir", "github_remote", "github_branch"]},
-    {"title": "Messenger", "fields": ["messenger"]},
-    {"title": "LLM Provider", "fields": ["llm"]},
-    {"title": "Environment", "fields": ["env"]},
-    {"title": "Advanced", "fields": ["watcher", "sandbox", "runner", "report"], "collapsed": true}
-  ]
+  "required": ["base_dir"],
+  "additionalProperties": false
 }

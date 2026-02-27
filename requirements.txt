@@ -1,19 +1,2 @@
-# ResearchClaw dependencies
-
-# Core
 PyYAML>=6.0
-anthropic>=0.80.0
-openai>=1.0.0
-
-# Secrets management (.env file support)
-python-dotenv>=1.0.0
-
-# Telegram messenger
-pyTelegramBotAPI>=4.17.0
-
-# Slack messenger (Socket Mode)
-slack_sdk>=3.27.0
-
-# TUI setup wizard
-questionary>=2.0.0
-rich>=13.0.0
+pytest>=8.0
