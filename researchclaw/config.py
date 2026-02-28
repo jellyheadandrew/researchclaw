@@ -11,9 +11,12 @@ import yaml
 class Config:
     base_dir: str
     messenger_type: str = "stdio"
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
     planner_use_claude: bool = True
     planner_claude_cli_path: str = "claude"
     planner_model: str = "claude-sonnet-4-6"
+    planner_web_search: bool = True
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
@@ -31,7 +34,10 @@ def load_config(config_path: str = "config.yaml") -> Config:
     return Config(
         base_dir=base_dir,
         messenger_type=str(messenger.get("type", "stdio")),
+        telegram_bot_token=str(messenger.get("bot_token", "")),
+        telegram_chat_id=str(messenger.get("chat_id", "")),
         planner_use_claude=bool(planner.get("use_claude", True)),
         planner_claude_cli_path=str(planner.get("claude_cli_path", "claude")),
         planner_model=str(planner.get("model", "claude-sonnet-4-6")),
+        planner_web_search=bool(planner.get("web_search", True)),
     )

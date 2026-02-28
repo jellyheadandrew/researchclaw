@@ -33,7 +33,7 @@ class StatePolicy:
 
 STATE_POLICIES: dict[State, StatePolicy] = {
     State.DECIDE: StatePolicy(True, False, False, False, False, False),
-    State.PLAN: StatePolicy(True, True, False, False, False, False),
+    State.PLAN: StatePolicy(True, True, False, False, False, True),
     State.EXPERIMENT_IMPLEMENT: StatePolicy(True, True, False, False, False, False),
     State.EXPERIMENT_EXECUTE: StatePolicy(True, True, True, False, False, False),
     State.EVAL_IMPLEMENT: StatePolicy(True, True, False, False, False, False),
@@ -95,6 +95,57 @@ class AuthorityManager:
             ]
             if not self._path_matches_any(p, allowed_roots):
                 raise AuthorityError(f"read denied in {state.value}: {p}")
+
+        # EXPERIMENT_EXECUTE: only trial sandbox
+        elif state == State.EXPERIMENT_EXECUTE:
+            if not trial:
+                raise AuthorityError("read denied in EXPERIMENT_EXECUTE: no active trial")
+            allowed_roots = [self.base_dir / trial.sandbox_path]
+            if not self._path_matches_any(p, allowed_roots):
+                raise AuthorityError(f"read denied in {state.value}: {p}")
+
+        # EVAL_EXECUTE: outputs + eval_codes + eval.sh + results
+        elif state == State.EVAL_EXECUTE:
+            if not trial:
+                raise AuthorityError("read denied in EVAL_EXECUTE: no active trial")
+            trial_sandbox = self.base_dir / trial.sandbox_path
+            allowed_roots = [
+                self.base_dir / trial.outputs_path,
+                trial_sandbox / "eval_codes",
+                self.base_dir / trial.results_path,
+            ]
+            allowed_files = [trial_sandbox / "eval.sh"]
+            if self._file_matches_any(p, allowed_files):
+                return p
+            if not self._path_matches_any(p, allowed_roots):
+                raise AuthorityError(f"read denied in {state.value}: {p}")
+
+        # REPORT_SUMMARY: trial sandbox + results + EXPERIMENT_LOGS.md + prior results
+        elif state == State.REPORT_SUMMARY:
+            if not trial:
+                raise AuthorityError("read denied in REPORT_SUMMARY: no active trial")
+            allowed_roots = [
+                self.base_dir / trial.sandbox_path,
+                self.base_dir / "results",
+            ]
+            allowed_files = [self.base_dir / "EXPERIMENT_LOGS.md"]
+            if self._file_matches_any(p, allowed_files):
+                return p
+            if not self._path_matches_any(p, allowed_roots):
+                raise AuthorityError(f"read denied in {state.value}: {p}")
+
+        # RESEARCH: references/ + EXPERIMENT_LOGS.md + results/
+        elif state == State.RESEARCH:
+            allowed_roots = [
+                self.base_dir / "references",
+                self.base_dir / "results",
+            ]
+            allowed_files = [self.base_dir / "EXPERIMENT_LOGS.md"]
+            if self._file_matches_any(p, allowed_files):
+                return p
+            if not self._path_matches_any(p, allowed_roots):
+                raise AuthorityError(f"read denied in {state.value}: {p}")
+
         return p
 
     def validate_write_path(
@@ -204,5 +255,13 @@ class AuthorityManager:
     def _path_matches_any(p: Path, roots: list[Path]) -> bool:
         for root in roots:
             if _is_relative_to(p, root.resolve()):
+                return True
+        return False
+
+    @staticmethod
+    def _file_matches_any(p: Path, files: list[Path]) -> bool:
+        resolved = p.resolve() if not p.is_absolute() else p
+        for f in files:
+            if resolved == f.resolve():
                 return True
         return False

@@ -1,4 +1,4 @@
-"""ResearchClaw V2 package."""
+"""ResearchClaw package."""
 
 from .states import State, TrialStatus
 from .models import Settings, TrialRecord, ProjectGitConfig

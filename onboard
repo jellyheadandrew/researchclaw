@@ -12,4 +12,6 @@ python3 -m venv "${VENV_DIR}"
 
 "${PYTHON}" -m researchclaw.init "${SCRIPT_DIR}/config.yaml"
 
+"${PYTHON}" -m researchclaw.onboard_git "${SCRIPT_DIR}/config.yaml"
+
 echo "Setup complete. Start with ./gateway"

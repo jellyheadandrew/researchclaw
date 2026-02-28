@@ -1,1 +1,1 @@
-"""ResearchClaw V2 tests."""
+"""ResearchClaw tests."""

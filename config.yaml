@@ -1,10 +1,15 @@
-# ResearchClaw V2 configuration
+# ResearchClaw configuration
 base_dir: "./workspace"
 
 messenger:
   type: stdio
+  # For Telegram, set type: telegram and provide bot_token + chat_id:
+  # type: telegram
+  # bot_token: ""
+  # chat_id: ""
 
 planner:
   use_claude: true
   claude_cli_path: claude
   model: claude-sonnet-4-6
+  web_search: true

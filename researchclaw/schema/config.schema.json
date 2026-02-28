@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ResearchClaw V2 Config",
+  "title": "ResearchClaw Config",
   "type": "object",
   "properties": {
     "base_dir": {
@@ -11,7 +11,13 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["stdio"]
+          "enum": ["stdio", "telegram"]
+        },
+        "bot_token": {
+          "type": "string"
+        },
+        "chat_id": {
+          "type": "string"
         }
       },
       "required": ["type"],
@@ -28,6 +34,9 @@
         },
         "model": {
           "type": "string"
+        },
+        "web_search": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

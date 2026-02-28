@@ -11,18 +11,21 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
+from .ai_worker import AIWorker
 from .config import Config
+from .cron import CronJob, CronScheduler, cadence_to_seconds
 from .git_manager import GitManager, ensure_project_config
 from .messenger import Messenger, get_messenger
 from .models import Settings, TrialRecord
 from .planner import PlanEngine
 from .policy import AuthorityError, AuthorityManager
 from .reporter import Reporter
+from .research_engine import ResearchEngine
 from .states import State, TrialStatus
 from .storage import StorageManager
 
 
-class ResearchClawV2:
+class ResearchClaw:
     def __init__(self, config: Config, messenger: Messenger | None = None):
         self.config = config
         self.storage = StorageManager(config.base_dir)
@@ -30,14 +33,38 @@ class ResearchClawV2:
 
         self.settings: Settings = self.storage.load_settings()
         self.authority = AuthorityManager(config.base_dir)
-        self.git = GitManager(config.base_dir, self.authority)
-        self.reporter = Reporter(config.base_dir)
-        self.planner = PlanEngine(
+        self.git = GitManager(config.base_dir, self.authority, settings=self.settings)
+        self.reporter = Reporter(
+            config.base_dir,
             use_claude=config.planner_use_claude,
             cli_path=config.planner_claude_cli_path,
             model=config.planner_model,
         )
-        self.messenger = messenger or get_messenger(config.messenger_type)
+        self.planner = PlanEngine(
+            use_claude=config.planner_use_claude,
+            cli_path=config.planner_claude_cli_path,
+            model=config.planner_model,
+            base_dir=config.base_dir,
+            web_search_enabled=config.planner_web_search,
+        )
+        self.ai_worker = AIWorker(
+            cli_path=config.planner_claude_cli_path,
+            model=config.planner_model,
+        ) if config.planner_use_claude else None
+        self.research_engine = ResearchEngine(
+            base_dir=config.base_dir,
+            cli_path=config.planner_claude_cli_path,
+            model=config.planner_model,
+            use_claude=config.planner_use_claude,
+        )
+        self.cron = CronScheduler(
+            state_path=Path(config.base_dir) / ".researchclaw" / "cron_state.json"
+        )
+        self.messenger = messenger or get_messenger(
+            config.messenger_type,
+            bot_token=config.telegram_bot_token,
+            chat_id=config.telegram_chat_id,
+        )
 
         self.state: State = State.DECIDE
         self.current_trial: TrialRecord | None = None
@@ -59,14 +86,18 @@ class ResearchClawV2:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        self.messenger.send("ResearchClaw V2 online.")
+        self.messenger.send("ResearchClaw online.")
+        self._setup_cron()
         self._on_enter_state(self.state)
-        while True:
-            self._maybe_send_research_nudge()
-            message = self.messenger.receive(timeout=1.0)
-            if message is None:
-                continue
-            self.handle_message(message.strip())
+        try:
+            while True:
+                self._maybe_send_research_nudge()
+                message = self.messenger.receive(timeout=1.0)
+                if message is None:
+                    continue
+                self.handle_message(message.strip())
+        finally:
+            self.cron.stop()
 
     def _restore_state(self) -> None:
         session = self.storage.load_session()
@@ -212,16 +243,16 @@ class ResearchClawV2:
     # ------------------------------------------------------------------
 
     def _handle_decide(self, msg: str) -> None:
-        lower = msg.lower()
+        lower = msg.lower().strip()
         if lower in {"/plan", "plan"}:
             self._transition(State.PLAN, "user selected PLAN")
             self._on_enter_state(State.PLAN)
             return
-        if lower in {"/view_summary", "view_summary", "summary"}:
+        if lower in {"/view_summary", "view_summary", "summary", "view summary"}:
             self._transition(State.VIEW_SUMMARY, "user selected VIEW_SUMMARY")
             self._on_enter_state(State.VIEW_SUMMARY)
             return
-        if lower in {"/update_and_push", "update_and_push", "push"}:
+        if lower in {"/update_and_push", "update_and_push", "push", "update and push", "update"}:
             self._transition(State.UPDATE_AND_PUSH, "user selected UPDATE_AND_PUSH")
             self._on_enter_state(State.UPDATE_AND_PUSH)
             return
@@ -234,13 +265,61 @@ class ResearchClawV2:
             self._on_enter_state(State.RESEARCH)
             return
 
+        # Natural language intent detection
+        if not msg.startswith("/"):
+            intent = self._classify_decide_intent(lower)
+            if intent:
+                self._handle_decide(intent)
+                return
+
         self._show_decide_menu()
+
+    def _classify_decide_intent(self, text: str) -> str | None:
+        """Keyword-based intent classification for DECIDE state."""
+        plan_keywords = {
+            "experiment", "try", "test", "run", "new trial", "start", "begin",
+            "next", "plan", "new experiment", "let's go", "another",
+        }
+        summary_keywords = {
+            "review", "look at", "past", "history", "results", "reports",
+            "see", "what happened", "show me", "summary", "view",
+        }
+        update_keywords = {
+            "push", "merge", "update", "assimilate", "commit", "deploy",
+            "sync", "upload",
+        }
+        settings_keywords = {
+            "config", "setting", "configure", "setup", "change setting",
+            "preferences", "options",
+        }
+        research_keywords = {
+            "paper", "search", "read", "brainstorm", "idea", "explore",
+            "research", "literature", "survey", "find papers",
+        }
+
+        for kw in plan_keywords:
+            if kw in text:
+                return "/plan"
+        for kw in research_keywords:
+            if kw in text:
+                return "/research"
+        for kw in summary_keywords:
+            if kw in text:
+                return "/view_summary"
+        for kw in update_keywords:
+            if kw in text:
+                return "/update_and_push"
+        for kw in settings_keywords:
+            if kw in text:
+                return "/settings"
+        return None
 
     def _handle_plan(self, msg: str) -> None:
         if not self.current_trial:
             self.current_trial = self.storage.create_trial(selected_project=None)
             self.storage.save_session(self.state, self.current_trial.trial_id)
 
+        # Slash command shortcuts
         if msg.startswith("/plan project "):
             selection = msg[len("/plan project ") :].strip()
             self._select_plan_project(selection)
@@ -254,20 +333,50 @@ class ResearchClawV2:
             if self.plan_draft.strip():
                 self.messenger.send(self.plan_draft)
             else:
-                self.messenger.send("No plan draft yet. Send guidance text to start drafting.")
+                self.messenger.send("No plan draft yet. Describe your experiment idea to start.")
             return
 
         if msg == "/plan approve":
-            if not self.plan_project_selected:
-                self.messenger.send("Select a starting project first: /plan project <number|name|scratch>")
-                return
-            self.current_trial.plan_approved = True
-            self.storage.append_trial_record(self.current_trial)
-            self._transition(State.EXPERIMENT_IMPLEMENT, "plan approved")
-            self._on_enter_state(State.EXPERIMENT_IMPLEMENT)
+            self._approve_plan()
             return
 
-        updated = self.planner.update_plan(self.plan_draft, msg, self.current_trial.selected_project)
+        # Natural language: detect project selection if not yet selected
+        if not self.plan_project_selected:
+            project_match = self._match_project_from_text(msg)
+            if project_match is not None:
+                self._select_plan_project(project_match)
+                return
+
+        # Natural language: detect plan approval
+        lower = msg.lower().strip()
+        approval_phrases = {
+            "approve", "approved", "looks good", "go ahead", "ship it",
+            "lgtm", "let's go", "do it", "start", "proceed", "yes",
+        }
+        if lower in approval_phrases or lower.startswith("approve"):
+            self._approve_plan()
+            return
+
+        # Natural language: detect show plan
+        show_phrases = {"show plan", "see the plan", "current plan", "what's the plan"}
+        if lower in show_phrases:
+            if self.plan_draft.strip():
+                self.messenger.send(self.plan_draft)
+            else:
+                self.messenger.send("No plan draft yet. Describe your experiment idea to start.")
+            return
+
+        # Everything else: update plan via AI
+        experiment_logs = self._read_experiment_logs()
+        prior_reports = self._gather_recent_reports()
+        updated = self.planner.update_plan(
+            self.plan_draft,
+            msg,
+            self.current_trial.selected_project,
+            experiment_logs=experiment_logs,
+            prior_reports=prior_reports,
+            autopilot=self.settings.autopilot_enabled,
+        )
         self.plan_draft = updated
         plan_path = self.storage.base_dir / self.current_trial.sandbox_path / "PLAN.md"
         try:
@@ -280,16 +389,63 @@ class ResearchClawV2:
 
         self.messenger.send("Updated plan draft:\n" + updated)
 
+    def _approve_plan(self) -> None:
+        """Approve the current plan and transition to automatic implementation."""
+        if not self.current_trial:
+            self.messenger.send("No active trial.")
+            return
+        if not self.plan_project_selected:
+            self.messenger.send(
+                "Please select a starting project first. "
+                "Say a project name/number, or 'scratch'."
+            )
+            return
+        if not self.plan_draft.strip():
+            self.messenger.send("No plan drafted yet. Describe your experiment idea first.")
+            return
+        self.current_trial.plan_approved = True
+        self.storage.append_trial_record(self.current_trial)
+        self.messenger.send("Plan approved! Starting automatic implementation...")
+        self._transition(State.EXPERIMENT_IMPLEMENT, "plan approved")
+        self._on_enter_state(State.EXPERIMENT_IMPLEMENT)
+
+    def _match_project_from_text(self, msg: str) -> str | None:
+        """Try to match a project selection from natural language text."""
+        lower = msg.lower().strip()
+        projects = self.storage.list_project_names()
+
+        # "scratch" or "from scratch" or "start fresh"
+        scratch_phrases = {"scratch", "from scratch", "start fresh", "nothing", "no project", "empty"}
+        if lower in scratch_phrases or any(p in lower for p in scratch_phrases):
+            return "scratch"
+
+        # Check for direct project name match
+        for name in projects:
+            if name.lower() in lower:
+                return name
+
+        # Check for number selection: "1", "project 1", "use 1", etc.
+        import re as _re
+        num_match = _re.search(r"\b(\d+)\b", lower)
+        if num_match:
+            idx = int(num_match.group(1))
+            if 1 <= idx <= len(projects):
+                return projects[idx - 1]
+
+        return None
+
     def _handle_experiment_implement(self, msg: str) -> None:
         if not self.current_trial:
             self.messenger.send("No active trial.")
             return
 
+        # Escape hatch: manual write session
         if msg.startswith("/write "):
             path = msg[len("/write ") :].strip()
             self._start_write_session(path)
             return
 
+        # Manual trigger: run experiment
         if msg == "/exp run":
             self._run_experiment_once()
             return
@@ -300,11 +456,10 @@ class ResearchClawV2:
             )
             return
 
+        # During auto-execution, user messages are informational
         self.messenger.send(
-            "EXPERIMENT_IMPLEMENT commands:\n"
-            "- /write <path>  (paths under codes/ or run.sh)\n"
-            "- /exp run\n"
-            "- /exp status"
+            "Experiment implementation is in progress. Use /abort to cancel, "
+            "or /write <path> for manual overrides."
         )
 
     def _handle_eval_implement(self, msg: str) -> None:
@@ -312,11 +467,13 @@ class ResearchClawV2:
             self.messenger.send("No active trial.")
             return
 
+        # Escape hatch: manual write session
         if msg.startswith("/write "):
             path = msg[len("/write ") :].strip()
             self._start_write_session(path)
             return
 
+        # Manual trigger: run eval
         if msg == "/eval run":
             self._run_eval_once()
             return
@@ -327,15 +484,16 @@ class ResearchClawV2:
             )
             return
 
+        # During auto-execution, user messages are informational
         self.messenger.send(
-            "EVAL_IMPLEMENT commands:\n"
-            "- /write <path>  (paths under eval_codes/ or eval.sh)\n"
-            "- /eval run\n"
-            "- /eval status"
+            "Evaluation implementation is in progress. Use /abort to cancel, "
+            "or /write <path> for manual overrides."
         )
 
     def _handle_view_summary(self, msg: str) -> None:
-        if msg == "/older":
+        lower = msg.lower().strip()
+
+        if lower == "/older" or any(kw in lower for kw in ["older", "more", "earlier", "previous", "all dates"]):
             dates = self.storage.list_dates()
             if not dates:
                 self.messenger.send("No trial dates available.")
@@ -348,7 +506,21 @@ class ResearchClawV2:
             self._send_trials_for_date(date)
             return
 
-        self.messenger.send("VIEW_SUMMARY commands: /older, /date YYYYMMDD, /exit")
+        # Natural language: detect date mention (YYYYMMDD pattern)
+        import re as _re
+        date_match = _re.search(r"\b(20\d{6})\b", msg)
+        if date_match:
+            self._send_trials_for_date(date_match.group(1))
+            return
+
+        if any(kw in lower for kw in ["exit", "back", "done", "leave"]):
+            self._handle_exit()
+            return
+
+        self.messenger.send(
+            "Say 'older' to see all dates, mention a date (YYYYMMDD) to drill down, "
+            "or 'exit' to go back."
+        )
 
     def _handle_update_and_push(self, msg: str) -> None:
         if msg.startswith("/project add-clone "):
@@ -387,7 +559,12 @@ class ResearchClawV2:
                 "- eval_max_iterations: max retries in EVAL loop\n"
                 "- view_summary_page_size: count of recent trials shown\n"
                 "- autopilot_enabled: skip DECIDE after report\n"
+                "- autopilot_max_consecutive_trials: max trials before autopilot stops\n"
+                "- autopilot_max_consecutive_failures: max consecutive failures before autopilot stops\n"
                 "- research_cadence: ask/disabled/hourly/6h/daily\n"
+                "- git_user_name: git identity name for commits\n"
+                "- git_user_email: git identity email for commits\n"
+                "- git_auth_method: system (use local credentials) or token\n"
                 "- project git fields: remote_url/default_branch/auth_source"
             )
             return
@@ -416,19 +593,36 @@ class ResearchClawV2:
                 self.messenger.send("Usage: /settings set <key> <value>")
                 return
 
-            if key in {"experiment_max_iterations", "eval_max_iterations", "view_summary_page_size"}:
+            int_keys = {
+                "experiment_max_iterations",
+                "eval_max_iterations",
+                "view_summary_page_size",
+                "autopilot_max_consecutive_trials",
+                "autopilot_max_consecutive_failures",
+            }
+            bool_keys = {"autopilot_enabled"}
+            str_keys = {"git_user_name", "git_user_email"}
+
+            if key in int_keys:
                 try:
                     setattr(self.settings, key, int(value))
                 except ValueError:
                     self.messenger.send(f"{key} must be an integer.")
                     return
-            elif key == "autopilot_enabled":
+            elif key in bool_keys:
                 setattr(self.settings, key, value.lower() in {"1", "true", "yes", "on"})
             elif key == "research_cadence":
                 if value not in {"ask", "disabled", "hourly", "6h", "daily"}:
                     self.messenger.send("research_cadence must be ask/disabled/hourly/6h/daily")
                     return
                 self.settings.research_cadence = value
+            elif key in str_keys:
+                setattr(self.settings, key, value)
+            elif key == "git_auth_method":
+                if value not in {"system", "token"}:
+                    self.messenger.send("git_auth_method must be system or token")
+                    return
+                self.settings.git_auth_method = value
             else:
                 self.messenger.send("Unknown key.")
                 return
@@ -460,16 +654,48 @@ class ResearchClawV2:
             self.settings.research_cadence = cadence
             self.storage.save_settings(self.settings)
             self.research_next_ping = self._calc_next_ping(cadence)
+            # Update cron scheduler
+            interval = cadence_to_seconds(cadence)
+            if interval > 0:
+                job = CronJob(
+                    job_id="research_nudge",
+                    interval_seconds=interval,
+                    callback=self._cron_research_nudge,
+                )
+                self.cron.register(job)
+                self.cron.start()
+            else:
+                self.cron.set_enabled("research_nudge", False)
             self.messenger.send(f"Research cadence set to {cadence}.")
             return
 
         if msg.startswith("/research brainstorm "):
-            note = msg[len("/research brainstorm ") :].strip()
-            if not note:
-                self.messenger.send("Provide note text.")
+            topic = msg[len("/research brainstorm ") :].strip()
+            if not topic:
+                self.messenger.send("Provide a topic.")
                 return
-            self._append_brainstorm(note)
-            self.messenger.send("Brainstorm note appended.")
+            history = self._read_experiment_logs()
+            result = self.research_engine.brainstorm(topic, history)
+            self._append_brainstorm(result)
+            self.messenger.send(result)
+            return
+
+        if msg.startswith("/research search "):
+            query = msg[len("/research search ") :].strip()
+            if not query:
+                self.messenger.send("Provide a search query.")
+                return
+            result = self.research_engine.search_papers(query)
+            self.messenger.send(result)
+            return
+
+        if msg.startswith("/research summarize "):
+            text = msg[len("/research summarize ") :].strip()
+            if not text:
+                self.messenger.send("Provide text to summarize.")
+                return
+            result = self.research_engine.summarize(text)
+            self.messenger.send(result)
             return
 
         if msg.startswith("/research download "):
@@ -480,13 +706,23 @@ class ResearchClawV2:
             self._download_reference(url)
             return
 
+        # Conversational mode — messages that don't start with / are routed to AI chat
+        if not msg.startswith("/"):
+            history = self._read_experiment_logs()
+            response = self.research_engine.chat(msg, history)
+            self.messenger.send(response)
+            return
+
         self.messenger.send(
             "RESEARCH commands:\n"
+            "- /research search <query>  (search papers)\n"
+            "- /research brainstorm <topic>  (AI-powered brainstorming)\n"
+            "- /research summarize <text>  (summarize content)\n"
             "- /research cadence <ask|disabled|hourly|6h|daily>\n"
-            "- /research brainstorm <text>\n"
             "- /research download <url>\n"
             "- /write <path>\n"
-            "- /exit"
+            "- /exit\n"
+            "Or just type naturally to chat about research ideas."
         )
 
     # ------------------------------------------------------------------
@@ -504,25 +740,47 @@ class ResearchClawV2:
                 self.storage.save_session(self.state, self.current_trial.trial_id)
             self.plan_project_selected = False
             self.plan_draft = ""
-            self.messenger.send(
-                f"[PLAN] Trial {self.current_trial.trial_name} created for {self.current_trial.date}.\n"
-                "Select a starting project first with /plan project <number|name|scratch>."
+
+            projects = self.storage.list_project_names()
+            if projects:
+                project_list = "\n".join(f"  ({i}) {p}" for i, p in enumerate(projects, 1))
+                self.messenger.send(
+                    f"Planning trial {self.current_trial.trial_name} ({self.current_trial.date}).\n\n"
+                    f"Which project should we start with?\n{project_list}\n\n"
+                    "Say a project name/number, or 'scratch' to start from nothing.\n"
+                    "Then describe your experiment idea — I'll help refine the plan."
+                )
+            else:
+                self.messenger.send(
+                    f"Planning trial {self.current_trial.trial_name} ({self.current_trial.date}).\n"
+                    "No projects set up yet — starting from scratch.\n"
+                    "Describe your experiment idea and I'll help build a plan."
+                )
+                self.plan_project_selected = True
+
+            # Proactive search for recent research trends
+            experiment_logs = self._read_experiment_logs()
+            prior_reports = self._gather_recent_reports()
+            search_results = self.planner.proactive_search(
+                None,
+                experiment_logs,
+                prior_reports,
             )
-            self._show_projects_for_plan()
+            if search_results:
+                self.messenger.send(
+                    "Here are some recent research trends that might be relevant:\n"
+                    + search_results
+                )
             return
 
         if state == State.EXPERIMENT_IMPLEMENT:
-            self.messenger.send(
-                "[EXPERIMENT_IMPLEMENT] Edit codes and run.sh.\n"
-                "Use /write <path> and finish with /endwrite, then /exp run."
-            )
+            self.messenger.send("[EXPERIMENT_IMPLEMENT] Generating experiment code from plan...")
+            self._auto_implement_experiment()
             return
 
         if state == State.EVAL_IMPLEMENT:
-            self.messenger.send(
-                "[EVAL_IMPLEMENT] Edit eval.sh and eval_codes.\n"
-                "Use /write <path>, then /eval run."
-            )
+            self.messenger.send("[EVAL_IMPLEMENT] Generating evaluation code...")
+            self._auto_implement_eval()
             return
 
         if state == State.VIEW_SUMMARY:
@@ -541,21 +799,22 @@ class ResearchClawV2:
 
         if state == State.RESEARCH:
             self.messenger.send(
-                "[RESEARCH] Set cadence with /research cadence <ask|disabled|hourly|6h|daily>.\n"
-                "Use /research brainstorm <text> to save ideation into references/YYYYMM/BRAINSTORM_DD.md."
+                "[RESEARCH] You can search papers, brainstorm, or just chat about ideas.\n"
+                "Commands: /research search, /research brainstorm, /research summarize, /research cadence\n"
+                "Or type naturally to discuss research ideas."
             )
             self.research_next_ping = self._calc_next_ping(self.settings.research_cadence)
             return
 
     def _show_decide_menu(self) -> None:
         self.messenger.send(
-            "[DECIDE] Choose next state:\n"
-            "- /plan\n"
-            "- /view_summary\n"
-            "- /update_and_push\n"
-            "- /settings\n"
-            "- /research\n"
-            "- /status"
+            "What would you like to do next?\n"
+            "- Plan a new experiment\n"
+            "- Review past trial results\n"
+            "- Push results to a project\n"
+            "- Explore research ideas\n"
+            "- Adjust settings\n\n"
+            "Just tell me what you'd like to do."
         )
 
     def _show_projects_for_plan(self) -> None:
@@ -569,6 +828,28 @@ class ResearchClawV2:
             lines.append(f"({i}) {name}")
         lines.append("Use /plan project <number|name|scratch>")
         self.messenger.send("\n".join(lines))
+
+    def _read_experiment_logs(self) -> str:
+        logs_path = self.storage.base_dir / "EXPERIMENT_LOGS.md"
+        if logs_path.exists():
+            try:
+                return logs_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        return ""
+
+    def _gather_recent_reports(self, max_reports: int = 5) -> list[str]:
+        results_dir = self.storage.base_dir / "results"
+        if not results_dir.exists():
+            return []
+        report_files = sorted(results_dir.rglob("REPORT.md"), reverse=True)
+        reports: list[str] = []
+        for rf in report_files[:max_reports]:
+            try:
+                reports.append(rf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return reports
 
     def _select_plan_project(self, selection: str) -> None:
         if not self.current_trial:
@@ -652,15 +933,13 @@ class ResearchClawV2:
             self.messenger.send(f"Cannot execute run.sh: {e}")
             return
 
-        if not self.messenger.confirm(f"Execute run.sh for {self.current_trial.trial_name}?"):
-            self.messenger.send("Execution cancelled.")
-            return
-
         self.current_trial.experiment_iter += 1
         self.storage.append_trial_record(self.current_trial)
 
         self._transition(State.EXPERIMENT_EXECUTE, "run.sh execution")
-        self.messenger.send("[EXPERIMENT_EXECUTE] Running run.sh...")
+        self.messenger.send(
+            f"[EXPERIMENT_EXECUTE] Running run.sh (iteration {self.current_trial.experiment_iter}/{self.settings.experiment_max_iterations})..."
+        )
 
         trial_root = self.storage.base_dir / self.current_trial.sandbox_path
         outputs_root = self.storage.base_dir / self.current_trial.outputs_path
@@ -689,8 +968,14 @@ class ResearchClawV2:
             self._run_report_summary("experiment max iterations reached")
             return
 
-        self._transition(State.EXPERIMENT_IMPLEMENT, "experiment failure retry")
-        self.messenger.send("Returning to EXPERIMENT_IMPLEMENT with failure logs. Update code and retry.")
+        # Ralph loop: auto-retry with fresh AI context (both autopilot and non-autopilot)
+        if self.ai_worker:
+            self._ralph_retry_experiment()
+            return
+
+        # No AI worker available — go to report summary
+        self.messenger.send("No AI worker available for auto-fix. Moving to report.")
+        self._run_report_summary("experiment failed, no AI worker for retry")
 
     def _run_eval_once(self) -> None:
         if not self.current_trial:
@@ -704,15 +989,13 @@ class ResearchClawV2:
             self.messenger.send(f"Cannot execute eval.sh: {e}")
             return
 
-        if not self.messenger.confirm(f"Execute eval.sh for {self.current_trial.trial_name}?"):
-            self.messenger.send("Evaluation cancelled.")
-            return
-
         self.current_trial.eval_iter += 1
         self.storage.append_trial_record(self.current_trial)
 
         self._transition(State.EVAL_EXECUTE, "eval.sh execution")
-        self.messenger.send("[EVAL_EXECUTE] Running eval.sh...")
+        self.messenger.send(
+            f"[EVAL_EXECUTE] Running eval.sh (iteration {self.current_trial.eval_iter}/{self.settings.eval_max_iterations})..."
+        )
 
         trial_root = self.storage.base_dir / self.current_trial.sandbox_path
         results_root = self.storage.base_dir / self.current_trial.results_path
@@ -740,8 +1023,353 @@ class ResearchClawV2:
             self._run_report_summary("eval max iterations reached")
             return
 
-        self._transition(State.EVAL_IMPLEMENT, "eval failure retry")
-        self.messenger.send("Returning to EVAL_IMPLEMENT with failure logs. Update eval code and retry.")
+        # Ralph loop: auto-retry with fresh AI context (both autopilot and non-autopilot)
+        if self.ai_worker:
+            self._ralph_retry_eval()
+            return
+
+        # No AI worker available — go to report summary
+        self.messenger.send("No AI worker available for auto-fix. Moving to report.")
+        self._run_report_summary("eval failed, no AI worker for retry")
+
+    # ------------------------------------------------------------------
+    # Auto-implementation (agent-driven code generation)
+    # ------------------------------------------------------------------
+
+    def _auto_implement_experiment(self) -> None:
+        """Auto-generate experiment code from PLAN.md using AI worker."""
+        if not self.current_trial:
+            self.messenger.send("No active trial.")
+            return
+
+        if not self.ai_worker:
+            self.messenger.send(
+                "AI worker unavailable. Use /write <path> to implement manually, "
+                "then /exp run to execute."
+            )
+            return
+
+        trial_root = self.storage.base_dir / self.current_trial.sandbox_path
+        plan_path = trial_root / "PLAN.md"
+        codes_dir = trial_root / "codes"
+
+        if not plan_path.exists():
+            self.messenger.send("No PLAN.md found. Cannot auto-implement.")
+            return
+
+        ok, output = self.ai_worker.implement_experiment(plan_path, codes_dir)
+
+        if not ok:
+            self.messenger.send(
+                f"AI implementation failed: {output}\n"
+                "Use /write <path> to implement manually, then /exp run."
+            )
+            return
+
+        patches = AIWorker.parse_file_patches(output)
+        if not patches:
+            self.messenger.send(
+                "AI produced no code files. Use /write <path> to implement manually, "
+                "then /exp run."
+            )
+            return
+
+        applied = 0
+        run_sh_generated = False
+        for rel_path, content in patches.items():
+            if rel_path == "run.sh":
+                target = trial_root / "run.sh"
+                run_sh_generated = True
+            else:
+                clean = rel_path.removeprefix("codes/")
+                target = codes_dir / clean
+            try:
+                validated = self.authority.validate_write_path(
+                    State.EXPERIMENT_IMPLEMENT, target, self.current_trial
+                )
+                validated.parent.mkdir(parents=True, exist_ok=True)
+                validated.write_text(content + "\n", encoding="utf-8")
+                if rel_path == "run.sh":
+                    validated.chmod(0o755)
+                applied += 1
+            except AuthorityError as e:
+                self.messenger.send(f"Write blocked for {rel_path}: {e}")
+
+        file_list = ", ".join(patches.keys())
+        self.messenger.send(
+            f"[EXPERIMENT_IMPLEMENT] Generated {applied} files: {file_list}"
+        )
+
+        if not run_sh_generated:
+            run_sh = trial_root / "run.sh"
+            if run_sh.read_text(encoding="utf-8").strip().endswith(
+                'echo "Define experiment commands in run.sh"'
+            ):
+                self.messenger.send(
+                    "Warning: run.sh was not generated by AI and still has placeholder content."
+                )
+
+        # Auto-transition to execution
+        self._run_experiment_once()
+
+    def _auto_implement_eval(self) -> None:
+        """Auto-generate evaluation code from PLAN.md and experiment outputs using AI worker."""
+        if not self.current_trial:
+            self.messenger.send("No active trial.")
+            return
+
+        if not self.ai_worker:
+            self.messenger.send(
+                "AI worker unavailable. Use /write <path> to implement eval manually, "
+                "then /eval run to execute."
+            )
+            return
+
+        trial_root = self.storage.base_dir / self.current_trial.sandbox_path
+        plan_path = trial_root / "PLAN.md"
+        codes_dir = trial_root / "codes"
+        outputs_dir = self.storage.base_dir / self.current_trial.outputs_path
+        eval_codes_dir = trial_root / "eval_codes"
+
+        ok, output = self.ai_worker.implement_eval(
+            plan_path, codes_dir, outputs_dir, eval_codes_dir
+        )
+
+        if not ok:
+            self.messenger.send(
+                f"AI eval implementation failed: {output}\n"
+                "Use /write <path> to implement manually, then /eval run."
+            )
+            return
+
+        patches = AIWorker.parse_file_patches(output)
+        if not patches:
+            self.messenger.send(
+                "AI produced no eval files. Use /write <path> to implement manually, "
+                "then /eval run."
+            )
+            return
+
+        applied = 0
+        for rel_path, content in patches.items():
+            if rel_path == "eval.sh":
+                target = trial_root / "eval.sh"
+            else:
+                clean = rel_path.removeprefix("eval_codes/")
+                target = eval_codes_dir / clean
+            try:
+                validated = self.authority.validate_write_path(
+                    State.EVAL_IMPLEMENT, target, self.current_trial
+                )
+                validated.parent.mkdir(parents=True, exist_ok=True)
+                validated.write_text(content + "\n", encoding="utf-8")
+                if rel_path == "eval.sh":
+                    validated.chmod(0o755)
+                applied += 1
+            except AuthorityError as e:
+                self.messenger.send(f"Write blocked for {rel_path}: {e}")
+
+        file_list = ", ".join(patches.keys())
+        self.messenger.send(
+            f"[EVAL_IMPLEMENT] Generated {applied} files: {file_list}"
+        )
+
+        # Auto-transition to execution
+        self._run_eval_once()
+
+    def _ralph_retry_experiment(self) -> None:
+        """Fresh AI context retry for experiment failure (Ralph loop philosophy).
+
+        Works in both autopilot and non-autopilot modes. Each retry spawns a
+        fresh AI subprocess with no prior conversation context.
+        """
+        assert self.current_trial is not None
+        assert self.ai_worker is not None
+
+        trial_root = self.storage.base_dir / self.current_trial.sandbox_path
+        outputs_root = self.storage.base_dir / self.current_trial.outputs_path
+
+        self.messenger.send("[RALPH LOOP] Spawning fresh AI worker to fix experiment code...")
+        ok, output = self.ai_worker.fix_experiment(
+            plan_path=trial_root / "PLAN.md",
+            codes_dir=trial_root / "codes",
+            stdout_log=outputs_root / "experiment_stdout.log",
+            stderr_log=outputs_root / "experiment_stderr.log",
+        )
+
+        if not ok:
+            self.messenger.send(f"AI fix failed: {output}. Moving to report.")
+            self._run_report_summary("experiment ralph fix failed")
+            return
+
+        patches = AIWorker.parse_file_patches(output)
+        if not patches:
+            self.messenger.send("AI determined no code changes needed. Moving to report.")
+            self._run_report_summary("experiment ralph no changes")
+            return
+
+        codes_root = trial_root / "codes"
+        applied = 0
+        for rel_path, content in patches.items():
+            clean = rel_path.removeprefix("codes/")
+            target = codes_root / clean
+            try:
+                validated = self.authority.validate_write_path(
+                    State.EXPERIMENT_IMPLEMENT, target, self.current_trial
+                )
+                validated.parent.mkdir(parents=True, exist_ok=True)
+                validated.write_text(content + "\n", encoding="utf-8")
+                applied += 1
+            except AuthorityError:
+                self.messenger.send(f"AI patch blocked for {clean}.")
+
+        self.messenger.send(f"[RALPH LOOP] Applied {applied} file patches. Re-running experiment...")
+        self._transition(State.EXPERIMENT_IMPLEMENT, "ralph fix applied")
+        self._run_experiment_once()
+
+    def _ralph_retry_eval(self) -> None:
+        """Fresh AI context retry for eval failure (Ralph loop philosophy).
+
+        Works in both autopilot and non-autopilot modes.
+        """
+        assert self.current_trial is not None
+        assert self.ai_worker is not None
+
+        trial_root = self.storage.base_dir / self.current_trial.sandbox_path
+        outputs_root = self.storage.base_dir / self.current_trial.outputs_path
+        results_root = self.storage.base_dir / self.current_trial.results_path
+
+        self.messenger.send("[RALPH LOOP] Spawning fresh AI worker to fix eval code...")
+        ok, output = self.ai_worker.fix_eval(
+            eval_codes_dir=trial_root / "eval_codes",
+            outputs_dir=outputs_root,
+            stdout_log=results_root / "eval_stdout.log",
+            stderr_log=results_root / "eval_stderr.log",
+        )
+
+        if not ok:
+            self.messenger.send(f"AI fix failed: {output}. Moving to report.")
+            self._run_report_summary("eval ralph fix failed")
+            return
+
+        patches = AIWorker.parse_file_patches(output)
+        if not patches:
+            self.messenger.send("AI determined no eval changes needed. Moving to report.")
+            self._run_report_summary("eval ralph no changes")
+            return
+
+        eval_codes_root = trial_root / "eval_codes"
+        applied = 0
+        for rel_path, content in patches.items():
+            clean = rel_path.removeprefix("eval_codes/")
+            target = eval_codes_root / clean
+            try:
+                validated = self.authority.validate_write_path(
+                    State.EVAL_IMPLEMENT, target, self.current_trial
+                )
+                validated.parent.mkdir(parents=True, exist_ok=True)
+                validated.write_text(content + "\n", encoding="utf-8")
+                applied += 1
+            except AuthorityError:
+                self.messenger.send(f"AI patch blocked for {clean}.")
+
+        self.messenger.send(f"[RALPH LOOP] Applied {applied} eval patches. Re-running evaluation...")
+        self._transition(State.EVAL_IMPLEMENT, "ralph fix applied")
+        self._run_eval_once()
+
+    def _should_stop_autopilot(self) -> bool:
+        max_check = max(
+            self.settings.autopilot_max_consecutive_trials,
+            self.settings.autopilot_max_consecutive_failures,
+        ) + 1
+        trials = self.storage.list_recent_trials(max_check)
+        if not trials:
+            return False
+
+        # Trials are sorted most-recent-first from list_recent_trials
+        consecutive = 0
+        consecutive_failures = 0
+        for t in trials:
+            if t.status in {TrialStatus.COMPLETED, TrialStatus.TERMINATED}:
+                consecutive += 1
+                if t.status == TrialStatus.TERMINATED:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+            else:
+                break
+
+        if consecutive >= self.settings.autopilot_max_consecutive_trials:
+            self.messenger.send(
+                f"Autopilot reached max consecutive trials ({self.settings.autopilot_max_consecutive_trials})."
+            )
+            return True
+
+        if consecutive_failures >= self.settings.autopilot_max_consecutive_failures:
+            self.messenger.send(
+                f"Autopilot reached max consecutive failures ({self.settings.autopilot_max_consecutive_failures})."
+            )
+            return True
+
+        return False
+
+    def _autopilot_plan(self) -> None:
+        """Auto-plan: select project, generate plan with AI, auto-approve."""
+        # Create trial
+        self.current_trial = self.storage.create_trial(selected_project=None)
+        self.storage.save_session(self.state, self.current_trial.trial_id)
+
+        # Auto-select project from most recent trial or first available
+        selected: str | None = None
+        recent = self.storage.list_recent_trials(10)
+        for t in recent:
+            if t.selected_project:
+                selected = t.selected_project
+                break
+        if not selected:
+            projects = self.storage.list_project_names()
+            selected = projects[0] if projects else None
+
+        try:
+            self.storage.replace_trial_codes_from_project(self.current_trial, selected)
+        except Exception:
+            pass
+        self.current_trial.selected_project = selected
+        self.plan_project_selected = True
+
+        self.messenger.send(
+            f"[AUTOPILOT PLAN] Trial {self.current_trial.trial_name} | "
+            f"Project: {selected or '(scratch)'}"
+        )
+
+        # Generate plan with AI (using autopilot=True for decisive prompt)
+        experiment_logs = self._read_experiment_logs()
+        prior_reports = self._gather_recent_reports()
+        plan = self.planner.update_plan(
+            "",
+            "Generate the next experiment plan based on prior results.",
+            selected,
+            experiment_logs=experiment_logs,
+            prior_reports=prior_reports,
+            autopilot=True,
+        )
+        self.plan_draft = plan
+
+        plan_path = self.storage.base_dir / self.current_trial.sandbox_path / "PLAN.md"
+        try:
+            validated = self.authority.validate_write_path(self.state, plan_path, self.current_trial)
+            validated.parent.mkdir(parents=True, exist_ok=True)
+            validated.write_text(plan + "\n", encoding="utf-8")
+        except AuthorityError as e:
+            self.messenger.send(f"Autopilot plan write blocked: {e}")
+
+        self.messenger.send(f"[AUTOPILOT] Plan generated:\n{plan[:500]}...")
+
+        # Auto-approve
+        self.current_trial.plan_approved = True
+        self.storage.append_trial_record(self.current_trial)
+        self._transition(State.EXPERIMENT_IMPLEMENT, "autopilot plan approved")
+        self._on_enter_state(State.EXPERIMENT_IMPLEMENT)
 
     def _run_report_summary(self, reason: str) -> None:
         if not self.current_trial:
@@ -775,9 +1403,15 @@ class ResearchClawV2:
         self._transition(State.DECIDE, "report complete")
 
         if self.settings.autopilot_enabled:
-            self.messenger.send("Autopilot is enabled. Moving directly to PLAN.")
-            self._transition(State.PLAN, "autopilot")
-            self._on_enter_state(State.PLAN)
+            if self._should_stop_autopilot():
+                self.messenger.send("Autopilot safeguard triggered. Disabling autopilot.")
+                self.settings.autopilot_enabled = False
+                self.storage.save_settings(self.settings)
+                self._on_enter_state(State.DECIDE)
+            else:
+                self.messenger.send("Autopilot is enabled. Auto-planning next trial...")
+                self._transition(State.PLAN, "autopilot")
+                self._autopilot_plan()
         else:
             self._on_enter_state(State.DECIDE)
 
@@ -863,7 +1497,20 @@ class ResearchClawV2:
         project = self.update_selected_project
 
         try:
-            copied = self.git.assimilate_trial_codes(self.state, trial, project)
+            # Try intelligent assimilation first, fall back to naive copy
+            if self.ai_worker:
+                self.messenger.send("Using AI-powered intelligent assimilation...")
+                applied, detail = self.git.assimilate_intelligently(
+                    self.state, trial, project, self.ai_worker
+                )
+                if applied:
+                    self.messenger.send(f"AI assimilation: {detail}")
+                else:
+                    self.messenger.send(f"AI assimilation returned no changes ({detail}). Falling back to naive copy.")
+                    applied = self.git.assimilate_trial_codes(self.state, trial, project)
+            else:
+                applied = self.git.assimilate_trial_codes(self.state, trial, project)
+
             cfg = ensure_project_config(self.settings, project)
             message = f"Assimilate {trial.trial_id}"
             push_out = self.git.commit_and_push(self.state, project, cfg, message)
@@ -872,9 +1519,10 @@ class ResearchClawV2:
             self.messenger.send(f"UPDATE_AND_PUSH failed: {e}")
             return
 
+        file_count = len(applied) if isinstance(applied, list) else 0
         self.messenger.send(
             f"Assimilation completed for {project}.\n"
-            f"Files updated: {len(copied)}\n"
+            f"Files updated: {file_count}\n"
             f"Push result: {push_out or 'ok'}"
         )
         self._transition(State.DECIDE, "update and push complete")
@@ -991,6 +1639,28 @@ class ResearchClawV2:
             return now + timedelta(days=1)
         return None
 
+    def _setup_cron(self) -> None:
+        interval = cadence_to_seconds(self.settings.research_cadence)
+        if interval > 0:
+            job = CronJob(
+                job_id="research_nudge",
+                interval_seconds=interval,
+                callback=self._cron_research_nudge,
+            )
+            self.cron.register(job)
+            self.cron.start()
+
+    def _cron_research_nudge(self) -> None:
+        history = self._read_experiment_logs()
+        nudge = self.research_engine.generate_nudge(history)
+        if nudge:
+            self.messenger.send(f"[Research Nudge] {nudge}")
+        else:
+            self.messenger.send(
+                "[Research Nudge] Capture one new hypothesis in /research brainstorm "
+                "and link it to a testable next trial."
+            )
+
     def _maybe_send_research_nudge(self) -> None:
         if self.state != State.RESEARCH:
             return
@@ -998,9 +1668,7 @@ class ResearchClawV2:
             self.research_next_ping = self._calc_next_ping(self.settings.research_cadence)
             return
         if datetime.now() >= self.research_next_ping:
-            self.messenger.send(
-                "[Research Nudge] Capture one new hypothesis in /research brainstorm and link it to a testable next trial."
-            )
+            self._cron_research_nudge()
             self.research_next_ping = self._calc_next_ping(self.settings.research_cadence)
 
     # ------------------------------------------------------------------
