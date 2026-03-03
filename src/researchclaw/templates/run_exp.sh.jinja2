@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -e
+
+TRIAL_DIR="{{ trial_dir }}"
+PYTHON_CMD="{{ python_command }}"
+VENV_DIR="${TRIAL_DIR}/env"
+REQUIREMENTS="${TRIAL_DIR}/requirements.txt"
+CODES_DIR="${TRIAL_DIR}/experiment/codes_exp"
+
+# Create venv if it doesn't exist
+if [ ! -d "${VENV_DIR}" ]; then
+    echo "[run_exp] Creating virtual environment..."
+    "${PYTHON_CMD}" -m venv "${VENV_DIR}"
+fi
+
+# Install requirements if file is non-empty
+if [ -s "${REQUIREMENTS}" ]; then
+    echo "[run_exp] Installing requirements..."
+    "${VENV_DIR}/bin/pip" install -r "${REQUIREMENTS}" -q
+fi
+
+# Run experiment code
+echo "[run_exp] Running experiment..."
+cd "${CODES_DIR}"
+"${VENV_DIR}/bin/python" main.py

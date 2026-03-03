@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "researchclaw"
+version = "0.1.0"
+description = "Automated research experiment orchestrator — plan, run, evaluate, iterate."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "jellyheadandrew" },
+]
+keywords = ["research", "experiments", "automation", "ai", "orchestrator"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "jinja2>=3.1",
+    "prompt-toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "types-PyYAML"]
+
+[project.urls]
+Homepage = "https://github.com/jellyheadandrew/researchclaw"
+Repository = "https://github.com/jellyheadandrew/researchclaw"
+
+[project.scripts]
+researchclaw = "researchclaw.cli:main"
