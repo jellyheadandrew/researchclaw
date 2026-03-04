@@ -39,6 +39,7 @@ dev = ["pytest", "mypy", "types-PyYAML"]
 [project.urls]
 Homepage = "https://github.com/jellyheadandrew/researchclaw"
 Repository = "https://github.com/jellyheadandrew/researchclaw"
+Issues = "https://github.com/jellyheadandrew/researchclaw/issues"
 
 [project.scripts]
 researchclaw = "researchclaw.cli:main"
