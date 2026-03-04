@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="researchclaw.png" alt="ResearchClaw" width="200">
+  <img src="researchclaw.png" alt="ResearchClaw" width="400">
 </p>
 
 # ResearchClaw
