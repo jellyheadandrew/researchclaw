@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="researchclaw.png" alt="ResearchClaw" width="200">
+</p>
+
 # ResearchClaw
 
 Experiment 24/7 while you sleep. Research assistant for projects.
