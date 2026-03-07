@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
+from conftest import FakeChatInterface
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm.decide import _persist_autopilot, handle_decide
 from researchclaw.fsm.engine import FSMEngine
@@ -15,22 +17,6 @@ from researchclaw.repl import ChatInput, SlashCommand, UserMessage
 from researchclaw.sandbox import SandboxManager
 
 import researchclaw.fsm.plan as plan_mod
-
-
-class FakeChatInterface:
-    """Fake chat interface with pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.sent: list[str] = []
-        self._responses = list(responses) if responses else []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def receive(self) -> ChatInput:
-        if not self._responses:
-            raise SystemExit("No more responses")
-        return self._responses.pop(0)
 
 
 # --- /autopilot with confirmation in DECIDE ---

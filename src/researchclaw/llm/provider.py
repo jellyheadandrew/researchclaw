@@ -49,8 +49,9 @@ class ClaudeCLIProvider(LLMProvider):
     Zero extra packages required — uses claude CLI already on user's system.
     """
 
-    def __init__(self, model: str = "claude-opus-4-6") -> None:
+    def __init__(self, model: str = "claude-opus-4-6", timeout: int = 0) -> None:
         self.model = model
+        self.timeout = timeout
 
     def _build_prompt(self, messages: list[dict[str, str]], system: str = "") -> str:
         """Format messages and system prompt into a single text prompt for claude -p."""
@@ -69,13 +70,14 @@ class ClaudeCLIProvider(LLMProvider):
     def chat(self, messages: list[dict[str, str]], system: str = "") -> str:
         """Send messages to claude CLI via subprocess and return response."""
         prompt = self._build_prompt(messages, system)
+        effective_timeout = self.timeout if self.timeout > 0 else None
         try:
             result = subprocess.run(
                 ["claude", "-p", "--model", self.model],
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=effective_timeout,
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -83,7 +85,10 @@ class ClaudeCLIProvider(LLMProvider):
                 "to set up an alternative provider via onboarding."
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Claude CLI timed out after 120 seconds.")
+            raise RuntimeError(
+                f"Claude CLI timed out after {self.timeout} seconds. "
+                "You can change this via set llm_timeout_seconds in settings."
+            )
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
@@ -305,4 +310,4 @@ def get_provider(config: ResearchClawConfig, **kwargs: Any) -> LLMProvider:
         return OpenAIProvider(api_key=config.api_key, model=config.model)
     else:
         # Default: Tier 0 claude CLI
-        return ClaudeCLIProvider(model=config.model)
+        return ClaudeCLIProvider(model=config.model, timeout=config.llm_timeout_seconds)

@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from conftest import FakeChat
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.decide import handle_decide
@@ -48,25 +49,6 @@ import researchclaw.fsm.report as report_mod
 
 
 # --- Test helpers ---
-
-
-class FakeChat:
-    """Fake chat interface with pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.responses = list(responses) if responses else []
-        self.sent: list[str] = []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def send_image(self, path: str, caption: str | None = None) -> None:
-        pass
-
-    def receive(self) -> ChatInput:
-        if not self.responses:
-            raise SystemExit("No more responses")
-        return self.responses.pop(0)
 
 
 class FakeProvider:

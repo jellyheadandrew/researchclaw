@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from pathlib import Path
-
-import yaml
 
 from researchclaw.config import ResearchClawConfig
 from researchclaw.models import TrialMeta

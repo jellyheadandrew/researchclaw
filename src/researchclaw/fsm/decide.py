@@ -6,23 +6,13 @@ from typing import Any
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.states import State
+from researchclaw.fsm._shared import persist_autopilot
 from researchclaw.models import TrialMeta
 from researchclaw.sandbox import SandboxManager
 
-
-def _persist_autopilot(config: ResearchClawConfig, project_dir: Path) -> None:
-    """Persist the current autopilot setting to the project config file."""
-    project_config_path = (
-        SandboxManager.sandbox_path(project_dir)
-        / "project_settings"
-        / "researchclaw.yaml"
-    )
-    if project_config_path.exists():
-        saved = ResearchClawConfig.load_from_yaml(project_config_path)
-    else:
-        saved = ResearchClawConfig()
-    saved.autopilot = config.autopilot
-    saved.save_to_yaml(project_config_path)
+# Backward-compatibility alias — tests import the private name via
+# ``from researchclaw.fsm.decide import _persist_autopilot``.
+_persist_autopilot = persist_autopilot
 
 
 # --- Decision options ---
@@ -118,16 +108,17 @@ def handle_decide(
     if chat_interface is not None:
         summary = _build_trial_summary(trial_dir, meta)
         autopilot_status = "ON" if config.autopilot else "OFF"
-        chat_interface.send(
-            f"[DECIDE] Trial complete. (Autopilot: {autopilot_status})\n\n{summary}"
+        chat_interface.send_status(
+            f"[DECIDE] Trial complete. (Autopilot: {autopilot_status})"
         )
+        chat_interface.send(summary)
 
     # Autopilot mode: auto-select new experiment
     if config.autopilot:
         meta.decision = "new_experiment"
         meta.decision_reasoning = "Autopilot mode: automatically starting new experiment."
         if chat_interface is not None:
-            chat_interface.send(
+            chat_interface.send_status(
                 "[Autopilot] Automatically starting new experiment."
             )
         return State.EXPERIMENT_PLAN

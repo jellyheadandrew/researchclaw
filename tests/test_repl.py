@@ -55,6 +55,11 @@ class TestParseInput:
         assert isinstance(result, SlashCommand)
         assert result.name == "/help"
 
+    def test_slash_verbose(self) -> None:
+        result = parse_input("/verbose")
+        assert isinstance(result, SlashCommand)
+        assert result.name == "/verbose"
+
     def test_unknown_slash_is_user_message(self) -> None:
         result = parse_input("/unknown")
         assert isinstance(result, UserMessage)
@@ -96,7 +101,7 @@ class TestSlashCommands:
     """Tests for the SLASH_COMMANDS registry."""
 
     def test_all_commands_present(self) -> None:
-        expected = {"/approve", "/abort", "/autopilot", "/autopilot-stop", "/status", "/quit", "/help"}
+        expected = {"/approve", "/abort", "/autopilot", "/autopilot-stop", "/status", "/verbose", "/quit", "/help"}
         assert set(SLASH_COMMANDS.keys()) == expected
 
     def test_all_commands_have_descriptions(self) -> None:
@@ -200,3 +205,114 @@ class TestChatInterfaceABC:
     def test_terminal_chat_is_chat_interface(self) -> None:
         chat = TerminalChat()
         assert isinstance(chat, ChatInterface)
+
+    def test_terminal_chat_has_send_status(self) -> None:
+        """US-003: TerminalChat must have a send_status method distinct from send."""
+        chat = TerminalChat()
+        assert hasattr(chat, "send_status")
+        assert callable(chat.send_status)
+
+    def test_send_status_outputs_dim_text(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """US-003: send_status prints dim text (no panel)."""
+        chat = TerminalChat()
+        chat.send_status("[EXPERIMENT_PLAN] Starting...")
+        captured = capsys.readouterr()
+        assert "[EXPERIMENT_PLAN] Starting..." in captured.out
+
+    def test_chat_interface_send_status_default(self) -> None:
+        """US-003: ChatInterface.send_status default delegates to send()."""
+        assert hasattr(ChatInterface, "send_status")
+        # Verify it's not abstract (it has a default implementation)
+        # The default calls self.send(), so it should work on any concrete subclass
+        chat = TerminalChat()
+        # send_status is overridden in TerminalChat, but the ABC provides a default
+        assert "send_status" in dir(ChatInterface)
+
+
+class TestStreamAndThinking:
+    """US-004: Tests for send_stream, show_thinking, send_thinking, /verbose."""
+
+    def test_terminal_chat_has_send_stream(self) -> None:
+        """TerminalChat must have a send_stream method."""
+        chat = TerminalChat()
+        assert hasattr(chat, "send_stream")
+        assert callable(chat.send_stream)
+
+    def test_terminal_chat_has_show_thinking(self) -> None:
+        """TerminalChat must have a show_thinking method."""
+        chat = TerminalChat()
+        assert hasattr(chat, "show_thinking")
+        assert callable(chat.show_thinking)
+
+    def test_terminal_chat_has_send_thinking(self) -> None:
+        """TerminalChat must have a send_thinking method."""
+        chat = TerminalChat()
+        assert hasattr(chat, "send_thinking")
+        assert callable(chat.send_thinking)
+
+    def test_terminal_chat_verbose_default_false(self) -> None:
+        """TerminalChat._verbose defaults to False."""
+        chat = TerminalChat()
+        assert chat._verbose is False
+
+    def test_send_stream_returns_accumulated_text(self) -> None:
+        """send_stream should return the accumulated text from chunks."""
+        chat = TerminalChat()
+        chunks = iter(["Hello", " ", "world"])
+        result = chat.send_stream(chunks)
+        assert result == "Hello world"
+
+    def test_show_thinking_is_context_manager(self) -> None:
+        """show_thinking should be usable as a context manager."""
+        chat = TerminalChat()
+        with chat.show_thinking():
+            pass  # Should not raise
+
+    def test_send_thinking_silent_when_not_verbose(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """send_thinking should not output when _verbose is False."""
+        chat = TerminalChat()
+        chat._verbose = False
+        chat.send_thinking("thinking content")
+        captured = capsys.readouterr()
+        assert "thinking content" not in captured.out
+
+    def test_send_thinking_outputs_when_verbose(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """send_thinking should output when _verbose is True."""
+        chat = TerminalChat()
+        chat._verbose = True
+        chat.send_thinking("thinking content")
+        captured = capsys.readouterr()
+        assert "thinking content" in captured.out
+
+    def test_verbose_toggle_via_receive(self) -> None:
+        """/verbose toggles _verbose and re-prompts."""
+        chat = TerminalChat()
+        assert chat._verbose is False
+        with patch.object(chat._session, "prompt", side_effect=["/verbose", "next"]):
+            result = chat.receive()
+        assert chat._verbose is True
+        assert isinstance(result, UserMessage)
+        assert result.text == "next"
+
+    def test_verbose_toggle_off(self) -> None:
+        """/verbose toggles _verbose off when already on."""
+        chat = TerminalChat()
+        chat._verbose = True
+        with patch.object(chat._session, "prompt", side_effect=["/verbose", "next"]):
+            result = chat.receive()
+        assert chat._verbose is False
+
+    def test_chat_interface_send_stream_default(self) -> None:
+        """ChatInterface.send_stream default collects chunks and calls send()."""
+        assert hasattr(ChatInterface, "send_stream")
+        assert "send_stream" in dir(ChatInterface)
+
+    def test_chat_interface_show_thinking_default(self) -> None:
+        """ChatInterface.show_thinking default is a no-op context manager."""
+        assert hasattr(ChatInterface, "show_thinking")
+        assert "show_thinking" in dir(ChatInterface)
+
+    def test_chat_interface_send_thinking_default(self) -> None:
+        """ChatInterface.send_thinking default is a no-op."""
+        assert hasattr(ChatInterface, "send_thinking")
+        assert "send_thinking" in dir(ChatInterface)

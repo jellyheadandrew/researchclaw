@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -24,6 +24,8 @@ class ResearchClawConfig:
     provider: str = "claude_cli"
     api_key: str = ""
     display_trials: int = 10
+    llm_timeout_seconds: int = 0
+    read_only_paths: list[str] = field(default_factory=list)
 
     def save_to_yaml(self, path: str | Path) -> None:
         """Save config to a YAML file."""

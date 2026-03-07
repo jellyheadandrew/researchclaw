@@ -5,65 +5,76 @@ from typing import Any
 
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm.states import State
+from researchclaw.fsm._shared import (
+    SYSTEM_PROMPT_NO_TERMINAL,
+    SYSTEM_PROMPT_PROACTIVE,
+    get_provider_safe,
+    noop_context,
+)
 from researchclaw.models import TrialMeta
+from researchclaw.permissions import build_read_paths_section
 from researchclaw.sandbox import SandboxManager
+
+# Backward-compatibility aliases — tests use
+# ``monkeypatch.setattr(report_mod, "_get_provider_safe", ...)``.
+_noop_context = noop_context
+_get_provider_safe = get_provider_safe
 
 
 # --- System prompts for summary agent ---
 
-SUMMARY_AGENT_SYSTEM = """\
-You are the Summary Agent for ResearchClaw, a research experiment orchestrator.
+SUMMARY_AGENT_SYSTEM = (
+    "You are the Summary Agent for ResearchClaw, a research experiment orchestrator.\n"
+    "\n"
+    "Your task is to analyze a completed experiment trial and generate a comprehensive REPORT.md.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "## Trial Information\n"
+    "- Trial directory: {trial_name}\n"
+    "- Trial number: {trial_number}\n"
+    "\n"
+    "## Experiment Plan\n"
+    "{plan_content}\n"
+    "\n"
+    "## Experiment Code\n"
+    "{experiment_code}\n"
+    "\n"
+    "## Experiment Outputs\n"
+    "{experiment_outputs}\n"
+    "\n"
+    "## Evaluation Code\n"
+    "{eval_code}\n"
+    "\n"
+    "## Evaluation Outputs\n"
+    "{eval_outputs}\n"
+    "\n"
+    "## Visualizations\n"
+    "{visualizations}\n"
+    "\n"
+    "## Prior Trial Reports\n"
+    "{prior_reports}\n"
+    "\n"
+    "## Instructions\n"
+    "Generate a comprehensive REPORT.md that includes:\n"
+    "1. **What was done**: Describe the experiment methodology\n"
+    "2. **Results summary**: Key findings and metrics\n"
+    "3. **Comparison with prior trials**: How this trial compares (if prior trials exist)\n"
+    "4. **Future directions**: Suggestions for next experiments\n"
+    "\n"
+    "Use markdown formatting. Be concise but thorough.\n"
+)
 
-Your task is to analyze a completed experiment trial and generate a comprehensive REPORT.md.
-
-## Trial Information
-- Trial directory: {trial_name}
-- Trial number: {trial_number}
-
-## Experiment Plan
-{plan_content}
-
-## Experiment Code
-{experiment_code}
-
-## Experiment Outputs
-{experiment_outputs}
-
-## Evaluation Code
-{eval_code}
-
-## Evaluation Outputs
-{eval_outputs}
-
-## Visualizations
-{visualizations}
-
-## Prior Trial Reports
-{prior_reports}
-
-## Instructions
-Generate a comprehensive REPORT.md that includes:
-1. **What was done**: Describe the experiment methodology
-2. **Results summary**: Key findings and metrics
-3. **Comparison with prior trials**: How this trial compares (if prior trials exist)
-4. **Future directions**: Suggestions for next experiments
-
-Use markdown formatting. Be concise but thorough.
-"""
-
-SUMMARY_LOG_SYSTEM = """\
-You are the Summary Agent for ResearchClaw. Summarize the following REPORT.md into \
-exactly 2-3 lines for the experiment log. Be concise and capture the key findings.
-"""
-
-
-def _get_provider_safe(config: ResearchClawConfig) -> Any | None:
-    """Try to get an LLM provider, return None if unavailable."""
-    try:
-        from researchclaw.llm.provider import get_provider
-        return get_provider(config)
-    except Exception:
-        return None
+SUMMARY_LOG_SYSTEM = (
+    "You are the Summary Agent for ResearchClaw. Summarize the following REPORT.md into "
+    "exactly 2-3 lines for the experiment log. Be concise and capture the key findings.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+)
 
 
 def _gather_trial_content(trial_dir: Path) -> dict[str, str]:
@@ -175,6 +186,7 @@ def _generate_report_llm(
     provider: Any,
     trial_content: dict[str, str],
     prior_reports: str,
+    config: ResearchClawConfig | None = None,
 ) -> str:
     """Generate REPORT.md content using the summary agent LLM."""
     system = SUMMARY_AGENT_SYSTEM.format(
@@ -188,6 +200,8 @@ def _generate_report_llm(
         visualizations=trial_content["visualizations"],
         prior_reports=prior_reports,
     )
+    if config is not None:
+        system += build_read_paths_section(config, meta)
 
     report = provider.chat(
         messages=[{
@@ -317,7 +331,7 @@ def handle_experiment_report(
         State.DECIDE always.
     """
     if chat_interface is not None:
-        chat_interface.send(
+        chat_interface.send_status(
             f"[EXPERIMENT_REPORT] Generating report for {trial_dir.name}... "
             f"(do not interrupt)"
         )
@@ -338,9 +352,12 @@ def handle_experiment_report(
     # Generate REPORT.md
     if provider is not None:
         try:
-            report_content = _generate_report_llm(
-                trial_dir, meta, provider, trial_content, prior_reports
-            )
+            thinking_ctx = chat_interface.show_thinking() if chat_interface is not None else _noop_context()
+            with thinking_ctx:
+                report_content = _generate_report_llm(
+                    trial_dir, meta, provider, trial_content, prior_reports,
+                    config=config,
+                )
         except Exception as e:
             if chat_interface is not None:
                 chat_interface.send(f"LLM error: {e}. Generating fallback report.")

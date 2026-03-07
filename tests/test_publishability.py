@@ -7,27 +7,12 @@ from typing import Any
 
 import pytest
 
+from conftest import FakeChatInterface
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm.merge import handle_merge_loop
 from researchclaw.fsm.states import State
 from researchclaw.models import TrialMeta
 from researchclaw.repl import ChatInput
-
-
-class FakeChatInterface:
-    """Fake chat interface for testing."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.sent: list[str] = []
-        self._responses = list(responses) if responses else []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def receive(self) -> ChatInput:
-        if not self._responses:
-            raise SystemExit("No more responses")
-        return self._responses.pop(0)
 
 
 # --- MERGE_LOOP handler tests ---

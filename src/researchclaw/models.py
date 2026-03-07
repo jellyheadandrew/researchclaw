@@ -22,6 +22,7 @@ class TrialMeta:
     eval_retry_count: int = 0
     decision: str | None = None
     decision_reasoning: str | None = None
+    trial_read_paths: list[str] = field(default_factory=list)
 
     def to_json(self, path: str | Path) -> None:
         """Write this TrialMeta to a JSON file."""

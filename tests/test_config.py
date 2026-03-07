@@ -16,6 +16,7 @@ class TestDefaultValues:
         assert config.autopilot is False
         assert config.experiment_timeout_seconds == 3600
         assert config.python_command == "python3"
+        assert config.llm_timeout_seconds == 0
 
 
 class TestSaveLoadRoundTrip:

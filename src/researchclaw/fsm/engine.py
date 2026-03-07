@@ -2,19 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.states import State
 from researchclaw.models import TrialMeta
 from researchclaw.sandbox import SandboxManager
-
-
-class ChatInterfaceProtocol(Protocol):
-    """Minimal protocol for chat interface used by the FSM engine."""
-
-    def send(self, message: str) -> None: ...
 
 
 HandlerFunc = Callable[

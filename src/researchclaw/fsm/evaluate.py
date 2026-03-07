@@ -11,85 +11,69 @@ import jinja2
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.states import State
+from researchclaw.fsm._shared import (
+    SYSTEM_PROMPT_NO_TERMINAL,
+    SYSTEM_PROMPT_PROACTIVE,
+    gather_project_context,
+    get_provider_safe,
+    noop_context,
+    parse_llm_response,
+    prompt_llm_unavailable,
+    try_ensure_venv,
+)
 from researchclaw.models import TrialMeta
+from researchclaw.permissions import build_read_paths_section
+
+# Backward-compatibility aliases — tests import these private names via
+# ``from researchclaw.fsm.evaluate import _parse_llm_response`` or
+# ``monkeypatch.setattr(evaluate_mod, "_get_provider_safe", ...)``.
+_noop_context = noop_context
+_get_provider_safe = get_provider_safe
+_prompt_llm_unavailable = prompt_llm_unavailable
+_parse_llm_response = parse_llm_response
+_try_ensure_venv = try_ensure_venv
+_gather_project_context = gather_project_context
 
 
 # --- System prompt for eval coding agent ---
 
-EVAL_CODING_AGENT_SYSTEM = """\
-You are the Evaluation Coding Agent for ResearchClaw, a research experiment orchestrator.
-
-Your task is to write evaluation code that analyzes the experiment outputs.
-
-## Experiment Plan
-{plan_content}
-
-## Experiment Outputs
-The experiment has been run and its outputs are available at: {outputs_dir}
-The trial root directory is: {trial_dir}
-
-## Instructions
-- Generate Python evaluation code as a single file: main.py
-- The code will be placed in the trial's experiment/codes_eval/ directory
-- It will be run via: {venv_python} main.py (inside the codes_eval directory)
-- Environment variables available: OUTPUTS_DIR (path to experiment outputs), TRIAL_DIR (path to trial root)
-- Read experiment outputs from OUTPUTS_DIR
-- Write any visualizations (.png, .mp4, etc.) to TRIAL_DIR (the trial root directory)
-- Print evaluation results to stdout — they will be captured automatically
-- If the evaluation needs additional Python packages, list them
-
-## Output Format
-Respond with TWO clearly separated sections:
-
-### REQUIREMENTS
-List any pip packages needed (one per line), or write NONE if no extra packages needed.
-
-### CODE
-The complete main.py content.
-"""
-
-
-def _get_provider_safe(config: ResearchClawConfig) -> Any | None:
-    """Try to get an LLM provider, return None if unavailable."""
-    try:
-        from researchclaw.llm.provider import get_provider
-        return get_provider(config)
-    except Exception:
-        return None
-
-
-def _prompt_llm_unavailable(chat_interface: Any, error_msg: str) -> str:
-    """Prompt user with retry/skip/quit options when LLM is unavailable.
-
-    Returns 'retry', 'skip', or 'quit'. If no chat_interface, returns 'skip'.
-    Raises TrialAborted if user sends /abort.
-    """
-    if chat_interface is None:
-        return "skip"
-
-    chat_interface.send(
-        f"{error_msg}\n"
-        "Options: (r)etry / (s)kip (use placeholder) / (q)uit"
-    )
-    try:
-        user_input = chat_interface.receive()
-    except (SystemExit, KeyboardInterrupt):
-        return "quit"
-
-    from researchclaw.repl import SlashCommand, UserMessage
-    if isinstance(user_input, SlashCommand):
-        if user_input.name == "/quit":
-            return "quit"
-        if user_input.name == "/abort":
-            raise TrialAborted("User aborted trial during LLM unavailability")
-        return "skip"
-
-    text = user_input.text.strip().lower() if isinstance(user_input, UserMessage) else ""
-    if text in ("r", "retry"):
-        return "retry"
-    if text in ("q", "quit"):
-        return "quit"
-    return "skip"
+EVAL_CODING_AGENT_SYSTEM = (
+    "You are the Evaluation Coding Agent for ResearchClaw, a research experiment orchestrator.\n"
+    "\n"
+    "Your task is to write evaluation code that analyzes the experiment outputs.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "{project_context}\n"
+    "\n"
+    "## Experiment Plan\n"
+    "{plan_content}\n"
+    "\n"
+    "## Experiment Outputs\n"
+    "The experiment has been run and its outputs are available at: {outputs_dir}\n"
+    "The trial root directory is: {trial_dir}\n"
+    "\n"
+    "## Instructions\n"
+    "- Generate Python evaluation code as a single file: main.py\n"
+    "- The code will be placed in the trial's experiment/codes_eval/ directory\n"
+    "- It will be run via: {venv_python} main.py (inside the codes_eval directory)\n"
+    "- Environment variables available: OUTPUTS_DIR (path to experiment outputs), TRIAL_DIR (path to trial root)\n"
+    "- Read experiment outputs from OUTPUTS_DIR\n"
+    "- Write any visualizations (.png, .mp4, etc.) to TRIAL_DIR (the trial root directory)\n"
+    "- Print evaluation results to stdout — they will be captured automatically\n"
+    "- If the evaluation needs additional Python packages, list them\n"
+    "\n"
+    "## Output Format\n"
+    "Respond with TWO clearly separated sections:\n"
+    "\n"
+    "### REQUIREMENTS\n"
+    "List any pip packages needed (one per line), or write NONE if no extra packages needed.\n"
+    "\n"
+    "### CODE\n"
+    "The complete main.py content.\n"
+)
 
 
 def _load_eval_template() -> jinja2.Template:
@@ -109,66 +93,6 @@ def _render_run_eval_sh(trial_dir: Path, config: ResearchClawConfig) -> str:
         trial_dir=str(trial_dir),
         python_command=config.python_command,
     )
-
-
-def _parse_llm_response(response: str) -> tuple[str, str]:
-    """Parse the LLM response into (requirements, code) sections.
-
-    Returns:
-        Tuple of (requirements_text, code_text). Requirements may be empty
-        or "NONE". Code is the main.py content.
-    """
-    requirements = ""
-    code = ""
-
-    response_upper = response.upper()
-
-    req_markers = ["### REQUIREMENTS", "## REQUIREMENTS", "REQUIREMENTS:"]
-    code_markers = ["### CODE", "## CODE", "CODE:", "```python", "```"]
-
-    req_start = -1
-    for marker in req_markers:
-        idx = response_upper.find(marker.upper())
-        if idx != -1:
-            req_start = idx + len(marker)
-            break
-
-    code_start = -1
-    for marker in code_markers:
-        idx = response_upper.find(marker.upper())
-        if idx != -1:
-            code_start = idx + len(marker)
-            break
-
-    if req_start != -1 and code_start != -1 and req_start < code_start:
-        requirements = response[req_start:code_start].strip()
-        for marker in code_markers:
-            upper_marker = marker.upper()
-            if upper_marker in requirements.upper():
-                end_idx = requirements.upper().find(upper_marker)
-                requirements = requirements[:end_idx].strip()
-                break
-        code = response[code_start:].strip()
-    elif code_start != -1:
-        code = response[code_start:].strip()
-    else:
-        code = response.strip()
-
-    if code.endswith("```"):
-        code = code[:-3].strip()
-    if code.startswith("```"):
-        newline = code.find("\n")
-        if newline != -1:
-            code = code[newline + 1:].strip()
-
-    if requirements.upper().strip() == "NONE":
-        requirements = ""
-    if requirements:
-        lines = [line.strip() for line in requirements.splitlines() if line.strip()]
-        lines = [l for l in lines if not l.startswith("#") and not l.startswith("```")]
-        requirements = "\n".join(lines)
-
-    return requirements, code
 
 
 def _write_eval_files(
@@ -239,7 +163,7 @@ def handle_eval_implement(
         State.EVAL_EXECUTE on success.
     """
     if chat_interface is not None:
-        chat_interface.send(f"[EVAL_IMPLEMENT] Generating evaluation code for {trial_dir.name}...")
+        chat_interface.send_status(f"[EVAL_IMPLEMENT] Generating evaluation code for {trial_dir.name}...")
 
     # Read PLAN.md
     plan_path = trial_dir / "PLAN.md"
@@ -265,23 +189,29 @@ def handle_eval_implement(
                 code = _placeholder_eval_code(plan_content)
                 break
 
+        project_dir = trial_dir.parent.parent.parent
+        project_context = _gather_project_context(project_dir)
         system = EVAL_CODING_AGENT_SYSTEM.format(
             plan_content=plan_content,
             outputs_dir=str(outputs_dir),
             trial_dir=str(trial_dir),
             venv_python="env/bin/python",
+            project_context=project_context,
         )
+        system += build_read_paths_section(config, meta)
         try:
-            response = provider.chat(
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Generate the evaluation code based on the plan and experiment outputs. "
-                        "Follow the output format with REQUIREMENTS and CODE sections."
-                    ),
-                }],
-                system=system,
-            )
+            thinking_ctx = chat_interface.show_thinking() if chat_interface is not None else _noop_context()
+            with thinking_ctx:
+                response = provider.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Generate the evaluation code based on the plan and experiment outputs. "
+                            "Follow the output format with REQUIREMENTS and CODE sections."
+                        ),
+                    }],
+                    system=system,
+                )
             requirements, code = _parse_llm_response(response)
             break
         except Exception as e:
@@ -374,51 +304,6 @@ def _save_eval_output_log(trial_dir: Path, retry_count: int, output: str) -> Pat
     return log_path
 
 
-def _try_ensure_venv(
-    trial_dir: Path,
-    config: ResearchClawConfig,
-    chat_interface: Any,
-) -> bool:
-    """Try to create the trial venv, prompting user on failure.
-
-    Returns True if venv is ready, False if user chose to skip.
-    Raises SystemExit if user chose to quit.
-    Raises TrialAborted if user sends /abort.
-    """
-    from researchclaw.sandbox.venv_manager import VenvManager
-
-    while True:
-        try:
-            VenvManager.ensure_venv(trial_dir, config.python_command)
-            return True
-        except Exception as e:
-            if chat_interface is None:
-                return False
-            chat_interface.send(
-                f"Venv creation failed: {e}\n"
-                "Options: (r)etry / (s)kip (run anyway) / (q)uit"
-            )
-            try:
-                user_input = chat_interface.receive()
-            except (SystemExit, KeyboardInterrupt):
-                raise SystemExit("User quit during venv creation failure")
-
-            from researchclaw.repl import SlashCommand, UserMessage
-            if isinstance(user_input, SlashCommand):
-                if user_input.name == "/quit":
-                    raise SystemExit("User quit during venv creation failure")
-                if user_input.name == "/abort":
-                    raise TrialAborted("User aborted trial during venv creation failure")
-                return False
-
-            text = user_input.text.strip().lower() if isinstance(user_input, UserMessage) else ""
-            if text in ("r", "retry"):
-                continue
-            if text in ("q", "quit"):
-                raise SystemExit("User quit during venv creation failure")
-            return False
-
-
 def handle_eval_execute(
     trial_dir: Path,
     meta: TrialMeta,
@@ -436,7 +321,7 @@ def handle_eval_execute(
     """
     retry = meta.eval_retry_count
     if chat_interface is not None:
-        chat_interface.send(
+        chat_interface.send_status(
             f"[EVAL_EXECUTE] Running evaluation for {trial_dir.name} "
             f"(attempt {retry + 1}/{config.max_retries})..."
         )

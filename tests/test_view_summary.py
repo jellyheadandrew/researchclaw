@@ -15,24 +15,9 @@ from researchclaw.fsm.view_summary import (
     handle_view_summary,
 )
 from researchclaw.models import TrialMeta
+from conftest import FakeChatInterface
 from researchclaw.repl import ChatInput, SlashCommand, UserMessage
 from researchclaw.sandbox import SandboxManager
-
-
-class FakeChatInterface:
-    """Fake chat interface with pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.sent: list[str] = []
-        self._responses = list(responses) if responses else []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def receive(self) -> ChatInput:
-        if not self._responses:
-            raise SystemExit("No more responses")
-        return self._responses.pop(0)
 
 
 def _setup_sandbox_with_logs(project_dir: Path, log_lines: list[str]) -> Path:
@@ -215,11 +200,11 @@ class TestHandleViewSummaryWithLogs:
         chat = FakeChatInterface(responses=[UserMessage("back")])
         handle_view_summary(trial_dir, meta, config, chat)
         # Should show only 2 most recent trials
-        first_msg = chat.sent[0]
-        assert "2 most recent" in first_msg
+        assert any("2 most recent" in m for m in chat.sent)
         # Most recent first — trial_001 from 20260303 and trial_002 from 20260302
-        assert "20260303" in first_msg
-        assert "20260302" in first_msg
+        table_msg = chat.sent[1]  # table is in second message (after status header)
+        assert "20260303" in table_msg
+        assert "20260302" in table_msg
 
     def test_back_returns_decide(self, tmp_path: Path) -> None:
         trial_dir = _setup_sandbox_with_logs(tmp_path, SAMPLE_LOG_LINES)
@@ -313,8 +298,8 @@ class TestHandleViewSummaryWithLogs:
         meta = TrialMeta()
         chat = FakeChatInterface(responses=[UserMessage("back")])
         handle_view_summary(trial_dir, meta, ResearchClawConfig(), chat)
-        # First sent message should have the table with most recent at top
-        table_msg = chat.sent[0]
+        # Table message is second (after status header)
+        table_msg = chat.sent[1]
         pos_303 = table_msg.find("20260303")
         pos_301 = table_msg.find("20260301")
         # 20260303 should appear before 20260301 in output (most recent first)

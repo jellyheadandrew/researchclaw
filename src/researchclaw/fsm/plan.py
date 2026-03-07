@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -7,68 +8,82 @@ from typing import Any
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.states import State
+from researchclaw.fsm._shared import (
+    SYSTEM_PROMPT_NO_TERMINAL,
+    SYSTEM_PROMPT_PROACTIVE,
+    gather_project_context,
+    get_provider_safe,
+    persist_autopilot,
+)
 from researchclaw.models import TrialMeta
+from researchclaw.permissions import build_read_paths_section
 from researchclaw.repl import ChatInput, SlashCommand, UserMessage
 from researchclaw.sandbox import SandboxManager
 
-
-def _persist_autopilot(config: ResearchClawConfig, project_dir: Path) -> None:
-    """Persist the current autopilot setting to the project config file."""
-    project_config_path = (
-        SandboxManager.sandbox_path(project_dir)
-        / "project_settings"
-        / "researchclaw.yaml"
-    )
-    if project_config_path.exists():
-        saved = ResearchClawConfig.load_from_yaml(project_config_path)
-    else:
-        saved = ResearchClawConfig()
-    saved.autopilot = config.autopilot
-    saved.save_to_yaml(project_config_path)
+# Backward-compatibility aliases — tests import these private names via
+# ``from researchclaw.fsm.plan import _gather_project_context`` or
+# ``monkeypatch.setattr(plan_mod, "_get_provider_safe", ...)``.
+_gather_project_context = gather_project_context
+_get_provider_safe = get_provider_safe
+_persist_autopilot = persist_autopilot
 
 
 # --- System prompts for agents ---
 
-PLANNING_AGENT_SYSTEM = """\
-You are the Planning Agent for ResearchClaw, a research experiment orchestrator.
+PLANNING_AGENT_SYSTEM = (
+    "You are the Planning Agent for ResearchClaw, a research experiment orchestrator.\n"
+    "\n"
+    "Your role is to brainstorm experiment direction with the user and help draft an experiment plan.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "{project_context}\n"
+    "\n"
+    "Context about prior trials (if any):\n"
+    "{historian_context}\n"
+    "\n"
+    "{search_context}\n"
+    "\n"
+    "Guidelines:\n"
+    "- Help the user define a clear experiment: hypothesis, methodology, expected outcomes\n"
+    "- Consider what was learned from prior trials (if any)\n"
+    "- Be concise and actionable\n"
+    "- End every message with:\n"
+    "**If you approve plan, please type /approve. If not, please iterate.**\n"
+)
 
-Your role is to brainstorm experiment direction with the user and help draft an experiment plan.
+HISTORIAN_AGENT_SYSTEM = (
+    "You are the Historian Agent for ResearchClaw. Summarize the following trial history "
+    "concisely (max 3000 tokens). Focus on key findings, patterns, and lessons learned.\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "For \u22645 trials: provide per-trial summaries.\n"
+    "For >5 trials: summarize overall themes/trends, then detail only the 3 most recent trials.\n"
+)
 
-Context about prior trials (if any):
-{historian_context}
-
-{search_context}
-
-Guidelines:
-- Help the user define a clear experiment: hypothesis, methodology, expected outcomes
-- Consider what was learned from prior trials (if any)
-- Be concise and actionable
-- End every message with:
-**If you approve plan, please type /approve. If not, please iterate.**
-"""
-
-HISTORIAN_AGENT_SYSTEM = """\
-You are the Historian Agent for ResearchClaw. Summarize the following trial history \
-concisely (max 3000 tokens). Focus on key findings, patterns, and lessons learned.
-
-For ≤5 trials: provide per-trial summaries.
-For >5 trials: summarize overall themes/trends, then detail only the 3 most recent trials.
-"""
-
-AUTOPILOT_PLAN_SYSTEM = """\
-You are the Planning Agent for ResearchClaw in autopilot mode.
-
-Context about prior trials (if any):
-{historian_context}
-
-Based on the trial history above, generate a complete experiment plan. Include:
-1. Hypothesis
-2. Methodology
-3. Expected outcomes
-4. Success criteria
-
-Be concise and actionable. Output the plan in markdown format.
-"""
+AUTOPILOT_PLAN_SYSTEM = (
+    "You are the Planning Agent for ResearchClaw in autopilot mode.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "{project_context}\n"
+    "\n"
+    "Context about prior trials (if any):\n"
+    "{historian_context}\n"
+    "\n"
+    "Based on the trial history above, generate a complete experiment plan. Include:\n"
+    "1. Hypothesis\n"
+    "2. Methodology\n"
+    "3. Expected outcomes\n"
+    "4. Success criteria\n"
+    "\n"
+    "Be concise and actionable. Output the plan in markdown format.\n"
+)
 
 
 # --- Historian agent ---
@@ -149,6 +164,29 @@ def _get_search_context() -> str:
     return ""
 
 
+def _load_conversation(trial_dir: Path) -> list[dict[str, str]]:
+    """Load conversation history from .conversation.json in trial_dir.
+
+    Returns an empty list if the file doesn't exist or is invalid.
+    """
+    conv_path = trial_dir / ".conversation.json"
+    if not conv_path.exists():
+        return []
+    try:
+        data = json.loads(conv_path.read_text())
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _save_conversation(trial_dir: Path, messages: list[dict[str, str]]) -> None:
+    """Save conversation messages to .conversation.json in trial_dir."""
+    conv_path = trial_dir / ".conversation.json"
+    conv_path.write_text(json.dumps(messages, indent=2))
+
+
 # --- Plan handler ---
 
 def handle_experiment_plan(
@@ -181,26 +219,18 @@ def handle_experiment_plan(
     project_dir = trial_dir.parent.parent.parent
     historian_context = _build_historian_context(project_dir, provider)
     search_context = _get_search_context()
+    project_context = _gather_project_context(project_dir)
 
     if config.autopilot:
         return _handle_autopilot_plan(
             trial_dir, meta, config, chat_interface, provider,
-            historian_context, search_context,
+            historian_context, search_context, project_context,
         )
 
     return _handle_interactive_plan(
         trial_dir, meta, config, chat_interface, provider,
-        historian_context, search_context,
+        historian_context, search_context, project_context,
     )
-
-
-def _get_provider_safe(config: ResearchClawConfig) -> Any | None:
-    """Try to get an LLM provider, return None if unavailable."""
-    try:
-        from researchclaw.llm.provider import get_provider
-        return get_provider(config)
-    except Exception:
-        return None
 
 
 def _handle_autopilot_plan(
@@ -211,15 +241,18 @@ def _handle_autopilot_plan(
     provider: Any | None,
     historian_context: str,
     search_context: str,
+    project_context: str = "",
 ) -> State:
     """Auto-generate a plan in autopilot mode."""
     if chat_interface is not None:
-        chat_interface.send("[autopilot] Generating experiment plan...")
+        chat_interface.send_status("[autopilot] Generating experiment plan...")
 
     if provider is not None:
         system = AUTOPILOT_PLAN_SYSTEM.format(
             historian_context=historian_context,
+            project_context=project_context,
         )
+        system += build_read_paths_section(config, meta)
         try:
             plan_content = provider.chat(
                 messages=[{
@@ -262,6 +295,7 @@ def _handle_interactive_plan(
     provider: Any | None,
     historian_context: str,
     search_context: str,
+    project_context: str = "",
 ) -> State:
     """Run interactive planning chat loop."""
     if chat_interface is None:
@@ -276,21 +310,25 @@ def _handle_interactive_plan(
     system = PLANNING_AGENT_SYSTEM.format(
         historian_context=historian_context,
         search_context=search_section,
+        project_context=project_context,
     )
+    system += build_read_paths_section(config, meta)
 
-    # Conversation accumulator
-    messages: list[dict[str, str]] = []
+    # Load conversation from prior session (if any)
+    messages: list[dict[str, str]] = _load_conversation(trial_dir)
+
+    if messages:
+        chat_interface.send_status("Resuming conversation...")
 
     # Initial greeting
+    chat_interface.send_status(f"[EXPERIMENT_PLAN] Starting planning for {trial_dir.name}.")
     if historian_context and historian_context != "No prior trials.":
         chat_interface.send(
-            f"[EXPERIMENT_PLAN] Starting planning for {trial_dir.name}.\n"
             f"I have context from prior trials. Let's plan the next experiment.\n\n"
             f"**If you approve plan, please type /approve. If not, please iterate.**"
         )
     else:
         chat_interface.send(
-            f"[EXPERIMENT_PLAN] Starting planning for {trial_dir.name}.\n"
             f"This is the first trial. What experiment would you like to run?\n\n"
             f"**If you approve plan, please type /approve. If not, please iterate.**"
         )
@@ -343,7 +381,7 @@ def _handle_interactive_plan(
                 )
                 return _handle_autopilot_plan(
                     trial_dir, meta, config, chat_interface, provider,
-                    historian_context, search_context,
+                    historian_context, search_context, project_context,
                 )
 
             elif user_input.name == "/autopilot-stop":
@@ -368,18 +406,23 @@ def _handle_interactive_plan(
         # Get LLM response
         if provider is not None:
             try:
-                response = provider.chat(messages=messages, system=system)
+                chunks = provider.chat_stream(messages=messages, system=system)
+                response = chat_interface.send_stream(chunks)
             except Exception as e:
                 response = f"*LLM error: {e}*\n\n**If you approve plan, please type /approve. If not, please iterate.**"
+                chat_interface.send(response)
         else:
             response = (
                 f"*No LLM provider available. Please describe your plan and type /approve when ready.*\n\n"
                 f"**If you approve plan, please type /approve. If not, please iterate.**"
             )
+            chat_interface.send(response)
 
         messages.append({"role": "assistant", "content": response})
         last_assistant_response = response
-        chat_interface.send(response)
+
+        # Persist conversation after each exchange
+        _save_conversation(trial_dir, messages)
 
 
 def _write_plan(trial_dir: Path, content: str) -> None:

@@ -44,6 +44,43 @@ class TestClaudeCLIProvider:
         provider = ClaudeCLIProvider(model="claude-sonnet-4-5-20250929")
         assert provider.model == "claude-sonnet-4-5-20250929"
 
+    def test_default_timeout(self) -> None:
+        provider = ClaudeCLIProvider()
+        assert provider.timeout == 0
+
+    def test_custom_timeout(self) -> None:
+        provider = ClaudeCLIProvider(timeout=300)
+        assert provider.timeout == 300
+
+    def test_chat_uses_custom_timeout(self) -> None:
+        provider = ClaudeCLIProvider(timeout=300)
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="OK\n", stderr=""
+        )
+        with patch("researchclaw.llm.provider.subprocess.run", return_value=mock_result) as mock_run:
+            provider.chat([{"role": "user", "content": "test"}])
+            call_kwargs = mock_run.call_args[1]
+            assert call_kwargs["timeout"] == 300
+
+    def test_chat_no_timeout_when_zero(self) -> None:
+        provider = ClaudeCLIProvider(timeout=0)
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="OK\n", stderr=""
+        )
+        with patch("researchclaw.llm.provider.subprocess.run", return_value=mock_result) as mock_run:
+            provider.chat([{"role": "user", "content": "test"}])
+            call_kwargs = mock_run.call_args[1]
+            assert call_kwargs["timeout"] is None
+
+    def test_chat_timeout_error_message_includes_settings_hint(self) -> None:
+        provider = ClaudeCLIProvider(timeout=60)
+        with patch(
+            "researchclaw.llm.provider.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=60),
+        ):
+            with pytest.raises(RuntimeError, match="set llm_timeout_seconds in settings"):
+                provider.chat([{"role": "user", "content": "test"}])
+
     def test_build_prompt_simple(self) -> None:
         provider = ClaudeCLIProvider()
         messages = [{"role": "user", "content": "Hello"}]
@@ -104,12 +141,12 @@ class TestClaudeCLIProvider:
                 provider.chat([{"role": "user", "content": "test"}])
 
     def test_chat_cli_timeout(self) -> None:
-        provider = ClaudeCLIProvider()
+        provider = ClaudeCLIProvider(timeout=120)
         with patch(
             "researchclaw.llm.provider.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=120),
         ):
-            with pytest.raises(RuntimeError, match="timed out"):
+            with pytest.raises(RuntimeError, match="timed out after 120 seconds"):
                 provider.chat([{"role": "user", "content": "test"}])
 
     def test_chat_nonzero_exit(self) -> None:
@@ -493,6 +530,12 @@ class TestGetProvider:
         config = ResearchClawConfig(provider="openai", api_key="")
         with pytest.raises(ValueError, match="API key"):
             get_provider(config)
+
+    def test_passes_timeout_to_claude_cli(self) -> None:
+        config = ResearchClawConfig(llm_timeout_seconds=300)
+        provider = get_provider(config)
+        assert isinstance(provider, ClaudeCLIProvider)
+        assert provider.timeout == 300
 
     def test_unknown_provider_falls_back_to_cli(self) -> None:
         config = ResearchClawConfig(provider="unknown_provider")

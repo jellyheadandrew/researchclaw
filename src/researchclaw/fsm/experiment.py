@@ -11,78 +11,62 @@ import jinja2
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm import TrialAborted
 from researchclaw.fsm.states import State
+from researchclaw.fsm._shared import (
+    SYSTEM_PROMPT_NO_TERMINAL,
+    SYSTEM_PROMPT_PROACTIVE,
+    gather_project_context,
+    get_provider_safe,
+    noop_context,
+    parse_llm_response,
+    prompt_llm_unavailable,
+    try_ensure_venv,
+)
 from researchclaw.models import TrialMeta
+from researchclaw.permissions import build_read_paths_section
+
+# Backward-compatibility aliases — tests import these private names via
+# ``from researchclaw.fsm.experiment import _parse_llm_response`` or
+# ``monkeypatch.setattr(experiment_mod, "_get_provider_safe", ...)``.
+_noop_context = noop_context
+_get_provider_safe = get_provider_safe
+_prompt_llm_unavailable = prompt_llm_unavailable
+_parse_llm_response = parse_llm_response
+_try_ensure_venv = try_ensure_venv
+_gather_project_context = gather_project_context
 
 
 # --- System prompt for coding agent ---
 
-CODING_AGENT_SYSTEM = """\
-You are the Coding Agent for ResearchClaw, a research experiment orchestrator.
-
-Your task is to implement the experiment described in the plan below.
-
-## Plan
-{plan_content}
-
-## Instructions
-- Generate Python experiment code as a single file: main.py
-- The code will be placed in the trial's experiment/codes_exp/ directory
-- It will be run via: {venv_python} main.py (inside the codes_exp directory)
-- Output results to stdout — they will be captured automatically
-- If the experiment needs additional Python packages, list them (one per line, pip format)
-
-## Output Format
-Respond with TWO clearly separated sections:
-
-### REQUIREMENTS
-List any pip packages needed (one per line), or write NONE if no extra packages needed.
-
-### CODE
-The complete main.py content.
-"""
-
-
-def _get_provider_safe(config: ResearchClawConfig) -> Any | None:
-    """Try to get an LLM provider, return None if unavailable."""
-    try:
-        from researchclaw.llm.provider import get_provider
-        return get_provider(config)
-    except Exception:
-        return None
-
-
-def _prompt_llm_unavailable(chat_interface: Any, error_msg: str) -> str:
-    """Prompt user with retry/skip/quit options when LLM is unavailable.
-
-    Returns 'retry', 'skip', or 'quit'. If no chat_interface, returns 'skip'.
-    Raises TrialAborted if user sends /abort.
-    """
-    if chat_interface is None:
-        return "skip"
-
-    chat_interface.send(
-        f"{error_msg}\n"
-        "Options: (r)etry / (s)kip (use placeholder) / (q)uit"
-    )
-    try:
-        user_input = chat_interface.receive()
-    except (SystemExit, KeyboardInterrupt):
-        return "quit"
-
-    from researchclaw.repl import SlashCommand, UserMessage
-    if isinstance(user_input, SlashCommand):
-        if user_input.name == "/quit":
-            return "quit"
-        if user_input.name == "/abort":
-            raise TrialAborted("User aborted trial during LLM unavailability")
-        return "skip"
-
-    text = user_input.text.strip().lower() if isinstance(user_input, UserMessage) else ""
-    if text in ("r", "retry"):
-        return "retry"
-    if text in ("q", "quit"):
-        return "quit"
-    return "skip"
+CODING_AGENT_SYSTEM = (
+    "You are the Coding Agent for ResearchClaw, a research experiment orchestrator.\n"
+    "\n"
+    "Your task is to implement the experiment described in the plan below.\n"
+    "\n"
+    + SYSTEM_PROMPT_NO_TERMINAL + "\n"
+    "\n"
+    + SYSTEM_PROMPT_PROACTIVE + "\n"
+    "\n"
+    "{project_context}\n"
+    "\n"
+    "## Plan\n"
+    "{plan_content}\n"
+    "\n"
+    "## Instructions\n"
+    "- Generate Python experiment code as a single file: main.py\n"
+    "- The code will be placed in the trial's experiment/codes_exp/ directory\n"
+    "- It will be run via: {venv_python} main.py (inside the codes_exp directory)\n"
+    "- Output results to stdout — they will be captured automatically\n"
+    "- If the experiment needs additional Python packages, list them (one per line, pip format)\n"
+    "\n"
+    "## Output Format\n"
+    "Respond with TWO clearly separated sections:\n"
+    "\n"
+    "### REQUIREMENTS\n"
+    "List any pip packages needed (one per line), or write NONE if no extra packages needed.\n"
+    "\n"
+    "### CODE\n"
+    "The complete main.py content.\n"
+)
 
 
 def _load_template() -> jinja2.Template:
@@ -102,78 +86,6 @@ def _render_run_exp_sh(trial_dir: Path, config: ResearchClawConfig) -> str:
         trial_dir=str(trial_dir),
         python_command=config.python_command,
     )
-
-
-def _parse_llm_response(response: str) -> tuple[str, str]:
-    """Parse the LLM response into (requirements, code) sections.
-
-    Returns:
-        Tuple of (requirements_text, code_text). Requirements may be empty
-        or "NONE". Code is the main.py content.
-    """
-    requirements = ""
-    code = ""
-
-    # Try to find ### REQUIREMENTS and ### CODE sections
-    response_upper = response.upper()
-
-    # Find requirements section
-    req_markers = ["### REQUIREMENTS", "## REQUIREMENTS", "REQUIREMENTS:"]
-    code_markers = ["### CODE", "## CODE", "CODE:", "```python", "```"]
-
-    req_start = -1
-    for marker in req_markers:
-        idx = response_upper.find(marker.upper())
-        if idx != -1:
-            req_start = idx + len(marker)
-            break
-
-    code_start = -1
-    for marker in code_markers:
-        idx = response_upper.find(marker.upper())
-        if idx != -1:
-            code_start = idx + len(marker)
-            break
-
-    if req_start != -1 and code_start != -1 and req_start < code_start:
-        # Both sections found in order
-        requirements = response[req_start:code_start].strip()
-        # Clean up code section markers from requirements
-        for marker in code_markers:
-            upper_marker = marker.upper()
-            if upper_marker in requirements.upper():
-                end_idx = requirements.upper().find(upper_marker)
-                requirements = requirements[:end_idx].strip()
-                break
-        code = response[code_start:].strip()
-    elif code_start != -1:
-        # Only code section found
-        code = response[code_start:].strip()
-    else:
-        # No clear sections — treat entire response as code
-        code = response.strip()
-
-    # Clean up code: remove trailing ``` if present
-    if code.endswith("```"):
-        code = code[:-3].strip()
-    # Remove leading ``` if present (from ```python marker)
-    if code.startswith("```"):
-        # Find end of first line
-        newline = code.find("\n")
-        if newline != -1:
-            code = code[newline + 1:].strip()
-
-    # Clean up requirements
-    if requirements.upper().strip() == "NONE":
-        requirements = ""
-    # Strip lines and filter empty
-    if requirements:
-        lines = [line.strip() for line in requirements.splitlines() if line.strip()]
-        # Remove lines that look like section headers
-        lines = [l for l in lines if not l.startswith("#") and not l.startswith("```")]
-        requirements = "\n".join(lines)
-
-    return requirements, code
 
 
 def _write_experiment_files(
@@ -220,7 +132,7 @@ def handle_experiment_implement(
         State.EXPERIMENT_EXECUTE on success.
     """
     if chat_interface is not None:
-        chat_interface.send(f"[EXPERIMENT_IMPLEMENT] Generating experiment code for {trial_dir.name}...")
+        chat_interface.send_status(f"[EXPERIMENT_IMPLEMENT] Generating experiment code for {trial_dir.name}...")
 
     # Read PLAN.md
     plan_path = trial_dir / "PLAN.md"
@@ -245,21 +157,27 @@ def handle_experiment_implement(
                 code = _placeholder_code(plan_content)
                 break
 
+        project_dir = trial_dir.parent.parent.parent
+        project_context = _gather_project_context(project_dir)
         system = CODING_AGENT_SYSTEM.format(
             plan_content=plan_content,
             venv_python="env/bin/python",
+            project_context=project_context,
         )
+        system += build_read_paths_section(config, meta)
         try:
-            response = provider.chat(
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Generate the experiment code based on the plan. "
-                        "Follow the output format with REQUIREMENTS and CODE sections."
-                    ),
-                }],
-                system=system,
-            )
+            thinking_ctx = chat_interface.show_thinking() if chat_interface is not None else _noop_context()
+            with thinking_ctx:
+                response = provider.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Generate the experiment code based on the plan. "
+                            "Follow the output format with REQUIREMENTS and CODE sections."
+                        ),
+                    }],
+                    system=system,
+                )
             requirements, code = _parse_llm_response(response)
             break
         except Exception as e:
@@ -368,51 +286,6 @@ def _save_output_log(trial_dir: Path, retry_count: int, output: str) -> Path:
     return log_path
 
 
-def _try_ensure_venv(
-    trial_dir: Path,
-    config: ResearchClawConfig,
-    chat_interface: Any,
-) -> bool:
-    """Try to create the trial venv, prompting user on failure.
-
-    Returns True if venv is ready, False if user chose to skip.
-    Raises SystemExit if user chose to quit.
-    Raises TrialAborted if user sends /abort.
-    """
-    from researchclaw.sandbox.venv_manager import VenvManager
-
-    while True:
-        try:
-            VenvManager.ensure_venv(trial_dir, config.python_command)
-            return True
-        except Exception as e:
-            if chat_interface is None:
-                return False
-            chat_interface.send(
-                f"Venv creation failed: {e}\n"
-                "Options: (r)etry / (s)kip (run anyway) / (q)uit"
-            )
-            try:
-                user_input = chat_interface.receive()
-            except (SystemExit, KeyboardInterrupt):
-                raise SystemExit("User quit during venv creation failure")
-
-            from researchclaw.repl import SlashCommand, UserMessage
-            if isinstance(user_input, SlashCommand):
-                if user_input.name == "/quit":
-                    raise SystemExit("User quit during venv creation failure")
-                if user_input.name == "/abort":
-                    raise TrialAborted("User aborted trial during venv creation failure")
-                return False
-
-            text = user_input.text.strip().lower() if isinstance(user_input, UserMessage) else ""
-            if text in ("r", "retry"):
-                continue
-            if text in ("q", "quit"):
-                raise SystemExit("User quit during venv creation failure")
-            return False
-
-
 def handle_experiment_execute(
     trial_dir: Path,
     meta: TrialMeta,
@@ -430,7 +303,7 @@ def handle_experiment_execute(
     """
     retry = meta.experiment_retry_count
     if chat_interface is not None:
-        chat_interface.send(
+        chat_interface.send_status(
             f"[EXPERIMENT_EXECUTE] Running experiment for {trial_dir.name} "
             f"(attempt {retry + 1}/{config.max_retries})..."
         )

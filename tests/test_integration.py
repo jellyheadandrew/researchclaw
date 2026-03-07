@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from conftest import FakeChatInterface
 from researchclaw.cli import _build_handlers, main
 from researchclaw.config import ResearchClawConfig
 from researchclaw.fsm.engine import FSMEngine
@@ -20,25 +21,6 @@ import researchclaw.fsm.evaluate as evaluate_mod
 import researchclaw.fsm.experiment as experiment_mod
 import researchclaw.fsm.plan as plan_mod
 import researchclaw.fsm.report as report_mod
-
-
-class FakeChatInterface:
-    """Fake chat interface with pre-programmed responses for integration tests."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.sent: list[str] = []
-        self._responses = list(responses) if responses else []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def send_image(self, path: str, caption: str | None = None) -> None:
-        self.sent.append(f"[IMAGE: {path}]")
-
-    def receive(self) -> ChatInput:
-        if not self._responses:
-            raise SystemExit("No more responses")
-        return self._responses.pop(0)
 
 
 def _patch_all_providers(monkeypatch: pytest.MonkeyPatch) -> None:

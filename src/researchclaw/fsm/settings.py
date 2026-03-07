@@ -23,6 +23,8 @@ CONFIG_DESCRIPTIONS: dict[str, str] = {
     "provider": "LLM provider: claude_cli, claude_agent_sdk, anthropic, openai",
     "api_key": "API key for the LLM provider (Tier 2 only)",
     "display_trials": "Number of recent trials to display in VIEW_SUMMARY",
+    "llm_timeout_seconds": "Timeout in seconds for LLM calls (0 means no timeout)",
+    "read_only_paths": "Paths the agent may read outside the project dir (comma-separated)",
 }
 
 # Fields that are safe to modify via settings
@@ -36,6 +38,8 @@ EDITABLE_FIELDS: set[str] = {
     "provider",
     "api_key",
     "display_trials",
+    "llm_timeout_seconds",
+    "read_only_paths",
 }
 
 # Type coercion map
@@ -49,6 +53,8 @@ FIELD_TYPES: dict[str, type] = {
     "provider": str,
     "api_key": str,
     "display_trials": int,
+    "llm_timeout_seconds": int,
+    "read_only_paths": list,
 }
 
 
@@ -130,6 +136,12 @@ def _coerce_value(field_name: str, raw_value: str) -> object | None:
         except ValueError:
             return None
 
+    if target_type is list:
+        # Comma-separated paths; empty string clears the list
+        if not raw_value.strip() or raw_value.strip().lower() in ("none", "[]"):
+            return []
+        return [p.strip() for p in raw_value.split(",") if p.strip()]
+
     # str
     return raw_value
 
@@ -176,10 +188,8 @@ def handle_settings(
     project_dir = trial_dir.parent.parent.parent
 
     if chat_interface is not None:
-        chat_interface.send(
-            "[SETTINGS] Configuration editor.\n\n"
-            + _format_config_display(config)
-        )
+        chat_interface.send_status("[SETTINGS] Configuration editor.")
+        chat_interface.send(_format_config_display(config))
 
     while True:
         if chat_interface is None:

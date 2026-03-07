@@ -21,7 +21,28 @@ Known limitations:
 
 ```bash
 pipx install researchclaw
+pipx ensurepath          # one-time: adds ~/.local/bin to PATH
 ```
+
+Then restart your shell. This works everywhere — bare terminal, conda environments, virtualenvs.
+
+**Alternative** (if pipx is unavailable):
+
+```bash
+pip install researchclaw
+```
+
+> Note: `pip install` places researchclaw inside your current environment. This may cause dependency conflicts with project packages. Prefer `pipx` + `ensurepath` for an isolated install.
+
+**Fallback** (if `researchclaw` command is not on PATH):
+
+```bash
+python -m researchclaw .
+```
+
+## Troubleshooting
+
+- **`researchclaw: command not found`** after install — Run `pipx ensurepath` and restart your shell. This adds `~/.local/bin` to your PATH so the command is available in all environments, including conda.
 
 ## Usage
 

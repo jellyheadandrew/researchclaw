@@ -104,7 +104,7 @@ def handle_view_summary(
 
     if not all_entries:
         if chat_interface is not None:
-            chat_interface.send("[VIEW_SUMMARY] No experiment logs found.")
+            chat_interface.send_status("[VIEW_SUMMARY] No experiment logs found.")
         return State.DECIDE
 
     # Determine how many trials to display
@@ -117,9 +117,9 @@ def handle_view_summary(
     recent_reversed = list(reversed(recent))  # most recent first
 
     if chat_interface is not None:
-        header = f"[VIEW_SUMMARY] Showing {len(recent_reversed)} most recent trial(s):\n"
+        chat_interface.send_status(f"[VIEW_SUMMARY] Showing {len(recent_reversed)} most recent trial(s):")
         table = _format_trial_table(recent_reversed)
-        chat_interface.send(header + table)
+        chat_interface.send(table)
 
         # Offer navigation options
         if len(all_entries) > display_count:

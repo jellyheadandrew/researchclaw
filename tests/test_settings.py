@@ -17,24 +17,9 @@ from researchclaw.fsm.settings import (
 )
 from researchclaw.fsm.states import State
 from researchclaw.models import TrialMeta
+from conftest import FakeChatInterface
 from researchclaw.repl import ChatInput, SlashCommand, UserMessage
 from researchclaw.sandbox import SandboxManager
-
-
-class FakeChatInterface:
-    """Fake chat interface with pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput] | None = None) -> None:
-        self.sent: list[str] = []
-        self._responses = list(responses) if responses else []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def receive(self) -> ChatInput:
-        if not self._responses:
-            raise SystemExit("No more responses")
-        return self._responses.pop(0)
 
 
 def _setup_sandbox(project_dir: Path) -> Path:

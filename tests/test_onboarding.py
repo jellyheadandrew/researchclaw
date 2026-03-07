@@ -6,6 +6,8 @@ from unittest.mock import patch
 import yaml
 
 from researchclaw.onboarding import (
+    _ensure_claude_cli_available,
+    _ensure_npm_available,
     _is_claude_cli_available,
     _prompt_choice,
     _prompt_text,
@@ -13,6 +15,7 @@ from researchclaw.onboarding import (
     needs_onboarding,
     run_onboarding,
 )
+from conftest import FakeChat
 from researchclaw.config import ResearchClawConfig
 from researchclaw.repl import ChatInterface, ChatInput, SlashCommand, UserMessage
 import researchclaw.onboarding as onboarding_mod
@@ -20,24 +23,6 @@ import researchclaw.config as config_mod
 
 
 # --- Fake ChatInterface for testing ---
-
-class FakeChat(ChatInterface):
-    """Fake chat interface that returns pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput]) -> None:
-        self.responses = list(responses)
-        self.sent: list[str] = []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def send_image(self, path: str, caption: str | None = None) -> None:
-        pass
-
-    def receive(self) -> ChatInput:
-        if not self.responses:
-            raise SystemExit("No more responses")
-        return self.responses.pop(0)
 
 
 # --- Tests for needs_onboarding ---
@@ -179,17 +164,23 @@ class TestRunOnboarding:
         assert isinstance(config, ResearchClawConfig)
         assert any("Onboarding complete" in m for m in chat.sent)
 
-    def test_tier0_skip_without_claude_exits(self, tmp_path: Path, monkeypatch: object) -> None:
-        self._patch_globals(monkeypatch, tmp_path)
+    def test_tier0_skip_without_claude_offers_autoinstall(self, tmp_path: Path, monkeypatch: object) -> None:
+        config_path = self._patch_globals(monkeypatch, tmp_path)
         monkeypatch.setattr(onboarding_mod.shutil, "which", lambda cmd: None)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod, "ensure_package", lambda pkg, pip: True)  # type: ignore[attr-defined]
 
-        chat = FakeChat([UserMessage("skip")])
-        try:
-            run_onboarding(chat)
-            assert False, "Expected SystemExit"
-        except SystemExit:
-            pass
-        assert any("not found" in m for m in chat.sent)
+        # User picks skip → claude not found → declines auto-install → picks sdk on second pass
+        chat = FakeChat([
+            UserMessage("skip"),   # first tier choice
+            UserMessage("no"),     # decline auto-install
+            UserMessage("sdk"),    # second tier choice (re-run onboarding)
+        ])
+        config = run_onboarding(chat)
+
+        assert any("not found" in m.lower() for m in chat.sent)
+        assert isinstance(config, ResearchClawConfig)
+        data = yaml.safe_load(config_path.read_text())
+        assert data["provider"] == "claude_agent_sdk"
 
     def test_tier1_sdk_install_success(self, tmp_path: Path, monkeypatch: object) -> None:
         config_path = self._patch_globals(monkeypatch, tmp_path)
@@ -278,6 +269,149 @@ class TestRunOnboarding:
         run_onboarding(chat)
 
         assert any("Configuration saved" in m for m in chat.sent)
+
+
+# --- Tests for _ensure_npm_available ---
+
+class TestEnsureNpmAvailable:
+    def test_npm_already_on_path(self, monkeypatch: object) -> None:
+        monkeypatch.setattr(onboarding_mod.shutil, "which", lambda cmd: "/usr/bin/npm")  # type: ignore[attr-defined]
+        chat = FakeChat([])
+        assert _ensure_npm_available(chat) is True
+        # Should not send any messages since npm was found immediately
+        assert len(chat.sent) == 0
+
+    def test_npm_not_found_no_curl_no_wget(self, tmp_path: Path, monkeypatch: object) -> None:
+        def fake_which(cmd: str) -> str | None:
+            return None  # nothing found
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os, "environ", {"HOME": str(tmp_path)})  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "expanduser", lambda p: str(tmp_path / ".nvm"))  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "isfile", lambda p: False)  # type: ignore[attr-defined]
+
+        chat = FakeChat([])
+        assert _ensure_npm_available(chat) is False
+        assert any("Neither curl nor wget" in m for m in chat.sent)
+
+    def test_npm_found_on_specific_command(self, monkeypatch: object) -> None:
+        """npm found via shutil.which — returns True immediately."""
+        def fake_which(cmd: str) -> str | None:
+            if cmd == "npm":
+                return "/usr/local/bin/npm"
+            return None
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        chat = FakeChat([])
+        assert _ensure_npm_available(chat) is True
+
+
+# --- Tests for _ensure_claude_cli_available ---
+
+class TestEnsureClaudeCLIAvailable:
+    def test_claude_already_on_path(self, monkeypatch: object) -> None:
+        monkeypatch.setattr(onboarding_mod.shutil, "which", lambda cmd: "/usr/bin/claude")  # type: ignore[attr-defined]
+        chat = FakeChat([])
+        assert _ensure_claude_cli_available(chat) is True
+        assert len(chat.sent) == 0
+
+    def test_claude_not_found_npm_not_found(self, tmp_path: Path, monkeypatch: object) -> None:
+        def fake_which(cmd: str) -> str | None:
+            return None
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os, "environ", {"HOME": str(tmp_path)})  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "expanduser", lambda p: str(tmp_path / ".nvm"))  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "isfile", lambda p: False)  # type: ignore[attr-defined]
+
+        chat = FakeChat([])
+        assert _ensure_claude_cli_available(chat) is False
+        assert any("Cannot install Claude Code without npm" in m for m in chat.sent)
+
+    def test_claude_found_via_which(self, monkeypatch: object) -> None:
+        """claude found on first check — returns True immediately."""
+        def fake_which(cmd: str) -> str | None:
+            if cmd == "claude":
+                return "/usr/local/bin/claude"
+            return None
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        chat = FakeChat([])
+        assert _ensure_claude_cli_available(chat) is True
+
+
+# --- Tests for auto-install flow in run_onboarding ---
+
+class TestAutoInstallFlow:
+    def _patch_globals(self, monkeypatch: object, tmp_path: Path) -> Path:
+        fake_dir = tmp_path / "config" / "researchclaw"
+        fake_path = fake_dir / "config.yaml"
+        monkeypatch.setattr(onboarding_mod, "GLOBAL_CONFIG_DIR", fake_dir)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod, "GLOBAL_CONFIG_PATH", fake_path)  # type: ignore[attr-defined]
+        return fake_path
+
+    def test_autoinstall_yes_succeeds(self, tmp_path: Path, monkeypatch: object) -> None:
+        config_path = self._patch_globals(monkeypatch, tmp_path)
+
+        # First call: claude not found. Second call (after install): claude found.
+        call_count = {"which": 0}
+        def fake_which(cmd: str) -> str | None:
+            if cmd == "claude":
+                call_count["which"] += 1
+                # Not found on first two checks (_is_claude_cli_available + start of _ensure),
+                # found after install
+                return "/usr/bin/claude" if call_count["which"] > 2 else None
+            if cmd == "npm":
+                return "/usr/bin/npm"
+            return None
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.subprocess, "run", lambda *a, **kw: None)  # type: ignore[attr-defined]
+
+        chat = FakeChat([
+            UserMessage("skip"),   # tier choice
+            UserMessage("yes"),    # auto-install
+        ])
+        config = run_onboarding(chat)
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["provider"] == "claude_cli"
+        assert any("Claude Code installed" in m for m in chat.sent)
+
+    def test_autoinstall_fail_then_quit(self, tmp_path: Path, monkeypatch: object) -> None:
+        self._patch_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(onboarding_mod.shutil, "which", lambda cmd: None)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os, "environ", {"HOME": str(tmp_path)})  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "expanduser", lambda p: str(tmp_path / ".nvm"))  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "isfile", lambda p: False)  # type: ignore[attr-defined]
+
+        chat = FakeChat([
+            UserMessage("skip"),   # tier choice
+            UserMessage("yes"),    # auto-install
+            UserMessage("quit"),   # quit after failure
+        ])
+        try:
+            run_onboarding(chat)
+            assert False, "Expected SystemExit"
+        except SystemExit:
+            pass
+
+    def test_autoinstall_fail_then_other_tier(self, tmp_path: Path, monkeypatch: object) -> None:
+        config_path = self._patch_globals(monkeypatch, tmp_path)
+
+        def fake_which(cmd: str) -> str | None:
+            return None
+        monkeypatch.setattr(onboarding_mod.shutil, "which", fake_which)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os, "environ", {"HOME": str(tmp_path)})  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "expanduser", lambda p: str(tmp_path / ".nvm"))  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod.os.path, "isfile", lambda p: False)  # type: ignore[attr-defined]
+        monkeypatch.setattr(onboarding_mod, "ensure_package", lambda pkg, pip: True)  # type: ignore[attr-defined]
+
+        chat = FakeChat([
+            UserMessage("skip"),    # tier choice
+            UserMessage("yes"),     # auto-install (will fail — no npm/curl/wget)
+            UserMessage("other"),   # choose different tier
+            UserMessage("sdk"),     # second onboarding: pick sdk
+        ])
+        config = run_onboarding(chat)
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["provider"] == "claude_agent_sdk"
 
 
 # --- Tests for CLI integration ---

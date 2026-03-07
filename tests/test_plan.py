@@ -10,13 +10,17 @@ from researchclaw.fsm.plan import (
     PLANNING_AGENT_SYSTEM,
     _build_historian_context,
     _default_plan,
+    _gather_project_context,
     _gather_trial_history,
     _get_search_context,
+    _load_conversation,
+    _save_conversation,
     _write_plan,
     handle_experiment_plan,
 )
 from researchclaw.fsm.states import State
 from researchclaw.models import TrialMeta
+from conftest import FakeChat
 from researchclaw.repl import ChatInput, SlashCommand, UserMessage
 from researchclaw.sandbox import SandboxManager
 
@@ -24,24 +28,6 @@ import researchclaw.fsm.plan as plan_mod
 
 
 # --- Fake ChatInterface for testing ---
-
-class FakeChat:
-    """Fake chat interface with pre-programmed responses."""
-
-    def __init__(self, responses: list[ChatInput]) -> None:
-        self.responses = list(responses)
-        self.sent: list[str] = []
-
-    def send(self, message: str) -> None:
-        self.sent.append(message)
-
-    def send_image(self, path: str, caption: str | None = None) -> None:
-        pass
-
-    def receive(self) -> ChatInput:
-        if not self.responses:
-            raise SystemExit("No more responses")
-        return self.responses.pop(0)
 
 
 # --- Fake LLM Provider ---
@@ -387,6 +373,9 @@ class TestInteractivePlan:
                 call_messages.append(list(messages))
                 return "Response\n\n**If you approve plan, please type /approve. If not, please iterate.**"
 
+            def chat_stream(self, messages: list[dict[str, str]], system: str = "") -> Any:
+                yield self.chat(messages, system)
+
         chat = FakeChat([
             UserMessage("first msg"),
             UserMessage("second msg"),
@@ -519,3 +508,205 @@ class TestSystemPrompts:
 
     def test_historian_system_mentions_threshold(self) -> None:
         assert "5" in HISTORIAN_AGENT_SYSTEM
+
+
+# --- Tests for _gather_project_context ---
+
+class TestGatherProjectContext:
+    def test_returns_nonempty_for_project_with_files(self, tmp_path: Path) -> None:
+        """A project directory with files returns non-empty context."""
+        (tmp_path / "README.md").write_text("# My Project\nA test project.")
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest]\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("print('hello')")
+        result = _gather_project_context(tmp_path)
+        assert len(result) > 0
+        assert "Project Structure" in result
+
+    def test_includes_readme_content(self, tmp_path: Path) -> None:
+        """README.md content is included in the context."""
+        (tmp_path / "README.md").write_text("# My Project\nImportant info here.")
+        result = _gather_project_context(tmp_path)
+        assert "Important info here" in result
+
+    def test_includes_pyproject_content(self, tmp_path: Path) -> None:
+        """pyproject.toml content is included in the context."""
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "myapp"')
+        result = _gather_project_context(tmp_path)
+        assert "myapp" in result
+
+    def test_excludes_sandbox_dir(self, tmp_path: Path) -> None:
+        """sandbox_researchclaw directory is excluded from tree."""
+        (tmp_path / "sandbox_researchclaw").mkdir()
+        (tmp_path / "sandbox_researchclaw" / "meta.json").write_text("{}")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("")
+        result = _gather_project_context(tmp_path)
+        assert "sandbox_researchclaw" not in result
+
+    def test_excludes_pycache_dir(self, tmp_path: Path) -> None:
+        """__pycache__ directory is excluded from tree."""
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "__pycache__" / "mod.pyc").write_text("")
+        result = _gather_project_context(tmp_path)
+        assert "__pycache__" not in result
+
+    def test_empty_for_nonexistent_dir(self) -> None:
+        """Non-existent directory returns empty string."""
+        result = _gather_project_context(Path("/nonexistent/project/dir"))
+        assert result == ""
+
+    def test_truncates_long_context(self, tmp_path: Path) -> None:
+        """Very long context is truncated to ~8000 chars."""
+        # Create a large README to force truncation
+        (tmp_path / "README.md").write_text("A" * 10000)
+        result = _gather_project_context(tmp_path)
+        assert len(result) <= 8100  # Allow small margin for truncation marker
+        assert "[... truncated]" in result
+
+    def test_file_tree_includes_directories(self, tmp_path: Path) -> None:
+        """File tree includes directory names with trailing /."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.py").write_text("")
+        result = _gather_project_context(tmp_path)
+        assert "src/" in result
+        assert "app.py" in result
+
+
+# --- Tests for _load_conversation and _save_conversation ---
+
+class TestConversationPersistence:
+    def test_save_then_load(self, tmp_path: Path) -> None:
+        """Save conversation, load it back, verify messages match."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+            {"role": "user", "content": "let's plan"},
+            {"role": "assistant", "content": "sure thing"},
+        ]
+        _save_conversation(tmp_path, messages)
+        loaded = _load_conversation(tmp_path)
+        assert loaded == messages
+
+    def test_empty_trial_dir_returns_empty(self, tmp_path: Path) -> None:
+        """Empty trial dir (no .conversation.json) returns empty list."""
+        result = _load_conversation(tmp_path)
+        assert result == []
+
+    def test_invalid_json_returns_empty(self, tmp_path: Path) -> None:
+        """Invalid JSON in .conversation.json returns empty list."""
+        (tmp_path / ".conversation.json").write_text("not valid json{{{")
+        result = _load_conversation(tmp_path)
+        assert result == []
+
+    def test_non_list_json_returns_empty(self, tmp_path: Path) -> None:
+        """Non-list JSON value returns empty list."""
+        (tmp_path / ".conversation.json").write_text('{"not": "a list"}')
+        result = _load_conversation(tmp_path)
+        assert result == []
+
+    def test_save_overwrites_previous(self, tmp_path: Path) -> None:
+        """Subsequent saves overwrite previous conversation."""
+        _save_conversation(tmp_path, [{"role": "user", "content": "first"}])
+        _save_conversation(tmp_path, [{"role": "user", "content": "second"}])
+        loaded = _load_conversation(tmp_path)
+        assert len(loaded) == 1
+        assert loaded[0]["content"] == "second"
+
+
+class TestConversationResume:
+    def test_resume_shows_message(self, tmp_path: Path, monkeypatch: object) -> None:
+        """Resuming with prior conversation shows 'Resuming conversation...' message."""
+        trial_dir = _setup_sandbox(tmp_path)
+
+        # Pre-populate conversation file
+        prior = [
+            {"role": "user", "content": "prior message"},
+            {"role": "assistant", "content": "prior response"},
+        ]
+        _save_conversation(trial_dir, prior)
+
+        chat = FakeChat([SlashCommand("/approve", "")])
+        config = ResearchClawConfig()
+        meta = TrialMeta()
+
+        monkeypatch.setattr(plan_mod, "_get_provider_safe", lambda cfg: None)  # type: ignore[attr-defined]
+
+        handle_experiment_plan(trial_dir, meta, config, chat)
+
+        assert any("Resuming conversation" in m for m in chat.sent)
+
+    def test_resume_preserves_prior_messages(self, tmp_path: Path, monkeypatch: object) -> None:
+        """Resumed conversation includes prior messages in LLM calls."""
+        trial_dir = _setup_sandbox(tmp_path)
+
+        prior = [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
+        _save_conversation(trial_dir, prior)
+
+        call_messages: list[list[dict[str, str]]] = []
+
+        class TrackingProvider:
+            def chat(self, messages: list[dict[str, str]], system: str = "") -> str:
+                call_messages.append(list(messages))
+                return "New response"
+
+            def chat_stream(self, messages: list[dict[str, str]], system: str = "") -> Any:
+                yield self.chat(messages, system)
+
+        chat = FakeChat([
+            UserMessage("new question"),
+            SlashCommand("/approve", ""),
+        ])
+        config = ResearchClawConfig()
+        meta = TrialMeta()
+
+        monkeypatch.setattr(plan_mod, "_get_provider_safe", lambda cfg: TrackingProvider())  # type: ignore[attr-defined]
+
+        handle_experiment_plan(trial_dir, meta, config, chat)
+
+        # The LLM call should include prior messages + new user message
+        assert len(call_messages) == 1
+        assert len(call_messages[0]) == 3  # prior user, prior assistant, new user
+        assert call_messages[0][0]["content"] == "prior question"
+        assert call_messages[0][1]["content"] == "prior answer"
+        assert call_messages[0][2]["content"] == "new question"
+
+    def test_no_resume_message_for_fresh_trial(self, tmp_path: Path, monkeypatch: object) -> None:
+        """Fresh trial (no prior conversation) does not show resume message."""
+        trial_dir = _setup_sandbox(tmp_path)
+
+        chat = FakeChat([SlashCommand("/approve", "")])
+        config = ResearchClawConfig()
+        meta = TrialMeta()
+
+        monkeypatch.setattr(plan_mod, "_get_provider_safe", lambda cfg: None)  # type: ignore[attr-defined]
+
+        handle_experiment_plan(trial_dir, meta, config, chat)
+
+        assert not any("Resuming conversation" in m for m in chat.sent)
+
+    def test_conversation_saved_after_exchange(self, tmp_path: Path, monkeypatch: object) -> None:
+        """Conversation is saved to .conversation.json after each exchange."""
+        trial_dir = _setup_sandbox(tmp_path)
+        provider = FakeProvider(responses=["LLM plan response"])
+        chat = FakeChat([
+            UserMessage("my experiment idea"),
+            SlashCommand("/approve", ""),
+        ])
+        config = ResearchClawConfig()
+        meta = TrialMeta()
+
+        monkeypatch.setattr(plan_mod, "_get_provider_safe", lambda cfg: provider)  # type: ignore[attr-defined]
+
+        handle_experiment_plan(trial_dir, meta, config, chat)
+
+        # .conversation.json should exist and contain the exchange
+        loaded = _load_conversation(trial_dir)
+        assert len(loaded) == 2
+        assert loaded[0]["role"] == "user"
+        assert loaded[0]["content"] == "my experiment idea"
+        assert loaded[1]["role"] == "assistant"
+        assert loaded[1]["content"] == "LLM plan response"
